@@ -1,6 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { setResponseHeader } from "@tanstack/react-start/server";
-import { Client } from "pg";
+import type { Client as PgClient } from "pg";
 import { z } from "zod";
 import { getAdminRequestStatus, type AdminRequestContext } from "@/lib/admin-auth";
 
@@ -208,7 +208,8 @@ async function decryptCredentials(
   return JSON.parse(new TextDecoder().decode(plain)) as WarehouseCredentials;
 }
 
-async function openClient(connectionString: string): Promise<Client> {
+async function openClient(connectionString: string): Promise<PgClient> {
+  const { Client } = await import("pg");
   const client = new Client({
     connectionString,
     connectionTimeoutMillis: 5000,

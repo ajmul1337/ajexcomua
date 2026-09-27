@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { Client } from "pg";
+import type { Client as PgClient } from "pg";
 import { z } from "zod";
 import { getAdminRequestStatus, type AdminRequestContext } from "@/lib/admin-auth";
 
@@ -37,9 +37,10 @@ function connectionString(context: AdminRequestContext): string | undefined {
     process.env["POSTGRES_URL_NON_POOLING"]
   );
 }
-async function db(context: AdminRequestContext): Promise<Client> {
+async function db(context: AdminRequestContext): Promise<PgClient> {
   const url = connectionString(context);
   if (!url) throw new Error("PostgreSQL не подключён");
+  const { Client } = await import("pg");
   const client = new Client({
     connectionString: url,
     connectionTimeoutMillis: 5000,
@@ -53,7 +54,7 @@ async function requireAdmin(context: AdminRequestContext): Promise<void> {
   if (!status.authenticated || status.role !== "admin")
     throw new Response("Forbidden", { status: 403 });
 }
-async function audit(client: Client, productId: string | null, action: string, payload: unknown) {
+async function audit(client: PgClient, productId: string | null, action: string, payload: unknown) {
   await client.query(
     "INSERT INTO product_admin_audit(product_id,action,payload) VALUES($1,$2,$3::jsonb)",
     [productId, action, JSON.stringify(payload)],

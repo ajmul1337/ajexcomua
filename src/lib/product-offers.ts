@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { Client } from "pg";
+import type { Client as PgClient } from "pg";
 import { z } from "zod";
 import { getAdminRequestStatus, type AdminRequestContext } from "@/lib/admin-auth";
 
@@ -18,9 +18,10 @@ function connectionString(context: AdminRequestContext): string | undefined {
   );
 }
 
-async function db(context: AdminRequestContext): Promise<Client> {
+async function db(context: AdminRequestContext): Promise<PgClient> {
   const url = connectionString(context);
   if (!url) throw new Error("PostgreSQL не подключён");
+  const { Client } = await import("pg");
   const client = new Client({
     connectionString: url,
     connectionTimeoutMillis: 10_000,

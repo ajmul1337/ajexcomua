@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { Client } from "pg";
+import type { Client as PgClient } from "pg";
 import { z } from "zod";
 import { type AdminRequestContext } from "@/lib/admin-auth";
 
@@ -62,9 +62,10 @@ function connectionString(context: AdminRequestContext): string | undefined {
     process.env["POSTGRES_URL_NON_POOLING"]
   );
 }
-async function db(context: AdminRequestContext): Promise<Client> {
+async function db(context: AdminRequestContext): Promise<PgClient> {
   const url = connectionString(context);
   if (!url) throw new Error("PostgreSQL не подключён");
+  const { Client } = await import("pg");
   const client = new Client({
     connectionString: url,
     connectionTimeoutMillis: 5000,
@@ -148,7 +149,10 @@ export const listVehicleOptions = createServerFn({ method: "GET" })
     }
   });
 
-async function queryCompatibleVehicleProducts(client: Client, data: z.infer<typeof productsInput>) {
+async function queryCompatibleVehicleProducts(
+  client: PgClient,
+  data: z.infer<typeof productsInput>,
+) {
   const params: unknown[] = [];
   const add = (value: unknown) => {
     params.push(value);

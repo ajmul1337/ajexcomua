@@ -1,6 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { setResponseHeader } from "@tanstack/react-start/server";
-import { Client } from "pg";
+import type { Client as PgClient } from "pg";
 import { z } from "zod";
 import { getAdminRequestStatus, type AdminRequestContext } from "@/lib/admin-auth";
 
@@ -163,6 +163,7 @@ export const searchCatalog = createServerFn({ method: "GET" })
         COALESCE((SELECT array_agg(limited.article ORDER BY limited.normalized_article) FROM (SELECT cn.article, cn.normalized_article FROM product_cross_numbers pcn JOIN cross_numbers cn ON cn.id=pcn.cross_number_id WHERE pcn.product_id=p.id ORDER BY cn.normalized_article LIMIT 12) limited), ARRAY[]::text[]) AS cross_numbers
       FROM candidates c JOIN products p ON p.id=c.id JOIN brands b ON b.id=p.brand_id
       ORDER BY c.relevance DESC,p.stock DESC,p.updated_at DESC,p.id`;
+    const { Client } = await import("pg");
     const client = new Client({
       connectionString,
       connectionTimeoutMillis: 5000,
@@ -197,6 +198,7 @@ export const autocompleteCatalog = createServerFn({ method: "GET" })
     const connectionString = getConnectionString(context);
     if (!connectionString) return { configured: false as const, items: [] };
     const normalized = normalizeArticle(data.query);
+    const { Client } = await import("pg");
     const client = new Client({
       connectionString,
       connectionTimeoutMillis: 5000,
@@ -240,6 +242,7 @@ export async function handleCatalogSearchApi(
   if (!connectionString)
     return Response.json({ ok: false, error: "Каталог временно недоступен" }, { status: 503 });
   const normalized = normalizeArticle(parsed.data.query);
+  const { Client } = await import("pg");
   const client = new Client({
     connectionString,
     connectionTimeoutMillis: 5000,
@@ -367,6 +370,7 @@ export const listAdminProducts = createServerFn({ method: "GET" })
       ORDER BY ${expression} ${direction}, p.id ${direction}
       LIMIT ${limitParam}`;
 
+    const { Client } = await import("pg");
     const client = new Client({
       connectionString,
       connectionTimeoutMillis: 5000,
@@ -415,6 +419,7 @@ export const getAdminCatalogOverview = createServerFn({ method: "GET" }).handler
     const connectionString = getConnectionString(context);
     if (!connectionString) return { configured: false as const };
 
+    const { Client } = await import("pg");
     const client = new Client({
       connectionString,
       connectionTimeoutMillis: 5000,

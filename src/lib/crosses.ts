@@ -1,7 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { Client } from "pg";
-import { parse as parseCsv } from "@fast-csv/parse";
-import { Readable } from "node:stream";
+import type { Client as PgClient } from "pg";
 import { getAdminRequestStatus, type AdminRequestContext } from "@/lib/admin-auth";
 import { z } from "zod";
 
@@ -42,9 +40,10 @@ function connectionString(context: AdminRequestContext): string | undefined {
     process.env["POSTGRES_URL_NON_POOLING"]
   );
 }
-async function db(context: AdminRequestContext): Promise<Client> {
+async function db(context: AdminRequestContext): Promise<PgClient> {
   const url = connectionString(context);
   if (!url) throw new Error("PostgreSQL не подключён");
+  const { Client } = await import("pg");
   const client = new Client({
     connectionString: url,
     connectionTimeoutMillis: 10000,
@@ -61,7 +60,7 @@ async function requireAdmin(context: AdminRequestContext): Promise<void> {
 function validEndpoint(value: CrossEndpoint): boolean {
   return Boolean(value.brand.trim() && value.article.trim());
 }
-async function endpointId(client: Client, endpoint: CrossEndpoint): Promise<string> {
+async function endpointId(client: PgClient, endpoint: CrossEndpoint): Promise<string> {
   const brand = endpoint.brand.trim();
   const article = endpoint.article.trim();
   const brandResult = await client.query<{ id: string }>(
@@ -79,7 +78,7 @@ async function endpointId(client: Client, endpoint: CrossEndpoint): Promise<stri
   return id;
 }
 async function linkEndpoints(
-  client: Client,
+  client: PgClient,
   left: CrossEndpoint,
   right: CrossEndpoint,
   source: string,
@@ -104,7 +103,7 @@ async function linkEndpoints(
   }
 }
 async function insertCanonicalLink(
-  client: Client,
+  client: PgClient,
   leftId: string,
   rightId: string,
   source: string,
@@ -419,6 +418,10 @@ export async function handleAdminCrossApi(
       [request.headers.get("x-file-name") ?? "crosses.csv"],
     );
     runId = run.rows[0]!.id;
+    const [{ Readable }, { parse: parseCsv }] = await Promise.all([
+      import("node:stream"),
+      import("@fast-csv/parse"),
+    ]);
     const parser = Readable.fromWeb(request.body as import("node:stream/web").ReadableStream).pipe(
       parseCsv({ headers: false, delimiter: ";", ignoreEmpty: true, trim: true }),
     );
