@@ -41,6 +41,7 @@ const importSettingsSchema = z.object({
   delimiter: z.enum(["auto", "comma", "semicolon", "tab"]).default("auto"),
   encoding: z.enum(["utf-8", "windows-1251"]).default("utf-8"),
   firstRowHeaders: z.boolean().default(true),
+  deleteMissing: z.boolean().default(false),
   columnMapping: z
     .object({
       article: z.string().trim().max(100).optional().default(""),
@@ -48,8 +49,19 @@ const importSettingsSchema = z.object({
       name: z.string().trim().max(100).optional().default(""),
       price: z.string().trim().max(100).optional().default(""),
       stock: z.string().trim().max(100).optional().default(""),
+      oem: z.string().trim().max(100).optional().default(""),
+      weight: z.string().trim().max(100).optional().default(""),
+      size: z.string().trim().max(100).optional().default(""),
+      image: z.string().trim().max(100).optional().default(""),
+      category: z.string().trim().max(100).optional().default(""),
     })
+    .catchall(z.string().trim().max(100))
     .default({}),
+});
+
+const importSettingsUpdateInput = z.object({
+  id: idSchema,
+  importSettings: importSettingsSchema,
 });
 
 const warehouseInput = z.object({
@@ -75,6 +87,20 @@ const warehouseInput = z.object({
   login: z.string().max(500).optional().default(""),
   password: z.string().max(2000).optional().default(""),
   clearCredentials: z.boolean().default(false),
+  autoUpdateEnabled: z.boolean().default(false),
+  updateFrequency: z.enum(["hourly", "daily", "weekly"]).default("daily"),
+  updateTime: z
+    .string()
+    .regex(/^\d{2}:\d{2}$/)
+    .default("03:00"),
+  updateTimezone: z.string().trim().max(80).default("UTC"),
+  sourceRequestParams: z.record(z.string(), z.unknown()).default({}),
+  emailProtocol: z.literal("imap").default("imap"),
+  emailFolder: z.string().trim().max(200).default("INBOX"),
+  emailFrom: emailSchema.default(""),
+  emailSubject: z.string().trim().max(500).default(""),
+  emailAttachmentPattern: z.string().trim().max(500).default(""),
+  emailAllowedExtensions: z.array(z.enum(["csv", "xlsx", "xls"])).default(["csv", "xlsx", "xls"]),
 });
 
 type Cursor = { sort: "name" | "updated"; value: string; id: string };
@@ -337,6 +363,19 @@ export const listAdminWarehouses = createServerFn({ method: "GET" })
         price_format: (typeof priceFormats)[number];
         is_active: boolean;
         import_settings: z.infer<typeof importSettingsSchema>;
+        auto_update_enabled: boolean;
+        update_frequency: string;
+        update_time: string;
+        update_timezone: string;
+        next_update_at: Date | null;
+        source_last_error: string | null;
+        source_request_params: Record<string, string | number | boolean | null>;
+        email_protocol: string;
+        email_folder: string;
+        email_from: string | null;
+        email_subject: string | null;
+        email_attachment_pattern: string | null;
+        email_allowed_extensions: string[];
         has_credentials: boolean;
         last_updated_at: Date | null;
         last_import_at: Date | null;
@@ -347,6 +386,8 @@ export const listAdminWarehouses = createServerFn({ method: "GET" })
         SELECT w.id::text, w.name, w.supplier_id::text, s.name AS supplier_name,
           w.source_type, w.contact_email, w.api_url, w.price_format, w.is_active,
           w.import_settings, (w.source_credentials_ciphertext IS NOT NULL) AS has_credentials,
+          w.auto_update_enabled, w.update_frequency, w.update_time, w.update_timezone, w.next_update_at, w.source_last_error,
+          w.source_request_params, w.email_protocol, w.email_folder, w.email_from, w.email_subject, w.email_attachment_pattern, w.email_allowed_extensions,
           w.last_updated_at, w.last_import_at, w.last_import_status, w.updated_at
         FROM warehouses w LEFT JOIN suppliers s ON s.id = w.supplier_id
         ${filters.length ? `WHERE ${filters.join(" AND ")}` : ""}
@@ -430,7 +471,8 @@ export const saveAdminWarehouse = createServerFn({ method: "POST" })
         await client.query(
           `UPDATE warehouses SET supplier_id=$2, name=$3, source_type=$4, contact_email=$5,
             api_url=$6, price_format=$7, is_active=$8, import_settings=$9::jsonb,
-            status=$10, updated_at=now() WHERE id=$1`,
+            status=$10, auto_update_enabled=$11, update_frequency=$12, update_time=$13::time, update_timezone=$14, source_request_params=$15::jsonb,
+            email_protocol=$16, email_folder=$17, email_from=$18, email_subject=$19, email_attachment_pattern=$20, email_allowed_extensions=$21, next_update_at=CASE WHEN $11 THEN COALESCE(next_update_at, now()) ELSE NULL END, updated_at=now() WHERE id=$1`,
           [
             id,
             data.supplierId,
@@ -442,12 +484,23 @@ export const saveAdminWarehouse = createServerFn({ method: "POST" })
             data.isActive,
             JSON.stringify(importSettings),
             data.isActive ? "active" : "paused",
+            data.autoUpdateEnabled,
+            data.updateFrequency,
+            data.updateTime,
+            data.updateTimezone,
+            JSON.stringify(data.sourceRequestParams),
+            data.emailProtocol,
+            data.emailFolder,
+            data.emailFrom || null,
+            data.emailSubject || null,
+            data.emailAttachmentPattern || null,
+            data.emailAllowedExtensions,
           ],
         );
       } else {
         const inserted = await client.query<{ id: string }>(
-          `INSERT INTO warehouses (supplier_id, name, source_type, contact_email, api_url, price_format, is_active, status, import_settings)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) RETURNING id::text`,
+          `INSERT INTO warehouses (supplier_id, name, source_type, contact_email, api_url, price_format, is_active, status, import_settings, auto_update_enabled, update_frequency, update_time, update_timezone, source_request_params, email_protocol, email_folder, email_from, email_subject, email_attachment_pattern, email_allowed_extensions, next_update_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::time,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,CASE WHEN $10 THEN now() ELSE NULL END) RETURNING id::text`,
           [
             data.supplierId,
             data.name,
@@ -458,6 +511,17 @@ export const saveAdminWarehouse = createServerFn({ method: "POST" })
             data.isActive,
             data.isActive ? "active" : "paused",
             JSON.stringify(importSettings),
+            data.autoUpdateEnabled,
+            data.updateFrequency,
+            data.updateTime,
+            data.updateTimezone,
+            JSON.stringify(data.sourceRequestParams),
+            data.emailProtocol,
+            data.emailFolder,
+            data.emailFrom || null,
+            data.emailSubject || null,
+            data.emailAttachmentPattern || null,
+            data.emailAllowedExtensions,
           ],
         );
         id = inserted.rows[0]!.id;
@@ -497,6 +561,41 @@ export const saveAdminWarehouse = createServerFn({ method: "POST" })
             ? "Добавьте секрет AJEX_CREDENTIALS_KEY, чтобы безопасно хранить API-ключи и пароли."
             : "Не удалось сохранить склад. Проверьте поля и привязку к поставщику.",
       };
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  });
+
+export const saveWarehouseImportSettings = createServerFn({ method: "POST" })
+  .validator(importSettingsUpdateInput)
+  .handler(async ({ data, context }) => {
+    const auth = await getAdminRequestStatus(context);
+    await requireAdmin(context);
+    const connectionString = getConnectionString(context);
+    if (!connectionString) return { ok: false as const, message: "Подключите PostgreSQL." };
+    const client = await openClient(connectionString);
+    try {
+      const result = await client.query(
+        `UPDATE warehouses SET import_settings=$2::jsonb, updated_at=now() WHERE id=$1 RETURNING id`,
+        [data.id, JSON.stringify(data.importSettings)],
+      );
+      if (!result.rowCount) return { ok: false as const, message: "Склад не найден." };
+      await client.query(
+        `INSERT INTO import_admin_audit(import_run_id,action,username,payload)
+         VALUES(NULL,$1,$2,$3::jsonb)`,
+        [
+          "delete_missing_setting_changed",
+          auth.authenticated ? auth.username : "admin",
+          JSON.stringify({
+            warehouseId: data.id,
+            deleteMissing: data.importSettings.deleteMissing === true,
+          }),
+        ],
+      );
+      return { ok: true as const };
+    } catch (error) {
+      console.error("Warehouse import settings save failed", error);
+      return { ok: false as const, message: "Не удалось сохранить схему импорта." };
     } finally {
       await client.end().catch(() => undefined);
     }

@@ -15,6 +15,7 @@ import { Route as AdminChangePasswordRouteImport } from './routes/admin.change-p
 import { Route as AdminLoginRouteImport } from './routes/admin.login'
 import { Route as AvtozapchastiIndexRouteImport } from './routes/avtozapchasti.index'
 import { Route as AvtozapchastiSlugRouteImport } from './routes/avtozapchasti.$slug'
+import { Route as CatalogProductIdRouteImport } from './routes/catalog.product.$id'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -46,6 +47,11 @@ const AvtozapchastiSlugRoute = AvtozapchastiSlugRouteImport.update({
   path: '/avtozapchasti/$slug',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CatalogProductIdRoute = CatalogProductIdRouteImport.update({
+  id: '/catalog/product/$id',
+  path: '/catalog/product/$id',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -54,6 +60,7 @@ export interface FileRoutesByFullPath {
   '/avtozapchasti/$slug': typeof AvtozapchastiSlugRoute
   '/admin/': typeof AdminIndexRoute
   '/avtozapchasti/': typeof AvtozapchastiIndexRoute
+  '/catalog/product/$id': typeof CatalogProductIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -62,6 +69,7 @@ export interface FileRoutesByTo {
   '/avtozapchasti/$slug': typeof AvtozapchastiSlugRoute
   '/admin': typeof AdminIndexRoute
   '/avtozapchasti': typeof AvtozapchastiIndexRoute
+  '/catalog/product/$id': typeof CatalogProductIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -71,6 +79,7 @@ export interface FileRoutesById {
   '/avtozapchasti/$slug': typeof AvtozapchastiSlugRoute
   '/admin/': typeof AdminIndexRoute
   '/avtozapchasti/': typeof AvtozapchastiIndexRoute
+  '/catalog/product/$id': typeof CatalogProductIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -81,6 +90,7 @@ export interface FileRouteTypes {
     | '/avtozapchasti/$slug'
     | '/admin/'
     | '/avtozapchasti/'
+    | '/catalog/product/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -89,6 +99,7 @@ export interface FileRouteTypes {
     | '/avtozapchasti/$slug'
     | '/admin'
     | '/avtozapchasti'
+    | '/catalog/product/$id'
   id:
     | '__root__'
     | '/'
@@ -97,6 +108,7 @@ export interface FileRouteTypes {
     | '/avtozapchasti/$slug'
     | '/admin/'
     | '/avtozapchasti/'
+    | '/catalog/product/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -106,6 +118,7 @@ export interface RootRouteChildren {
   AvtozapchastiSlugRoute: typeof AvtozapchastiSlugRoute
   AdminIndexRoute: typeof AdminIndexRoute
   AvtozapchastiIndexRoute: typeof AvtozapchastiIndexRoute
+  CatalogProductIdRoute: typeof CatalogProductIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -152,6 +165,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AvtozapchastiSlugRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/catalog/product/$id': {
+      id: '/catalog/product/$id'
+      path: '/catalog/product/$id'
+      fullPath: '/catalog/product/$id'
+      preLoaderRoute: typeof CatalogProductIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -162,6 +182,7 @@ const rootRouteChildren: RootRouteChildren = {
   AvtozapchastiSlugRoute: AvtozapchastiSlugRoute,
   AdminIndexRoute: AdminIndexRoute,
   AvtozapchastiIndexRoute: AvtozapchastiIndexRoute,
+  CatalogProductIdRoute: CatalogProductIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

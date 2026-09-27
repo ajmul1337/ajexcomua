@@ -27,12 +27,28 @@ type AdminSession = {
 
 export type WorkerBindings = {
   HYPERDRIVE?: { connectionString: string };
+  IMPORTS_BUCKET?: {
+    put(
+      key: string,
+      value: ReadableStream | string | ArrayBuffer | ArrayBufferView,
+    ): Promise<unknown>;
+    get(key: string): Promise<{
+      body: ReadableStream;
+      text(): Promise<string>;
+      arrayBuffer(): Promise<ArrayBuffer>;
+    } | null>;
+    delete(key: string): Promise<void>;
+  };
   AJEX_CREDENTIALS_KEY?: string;
   ADMIN_SESSION_SECRET?: string;
 };
 
 export type AdminRequestContext = {
-  adminRuntime?: { cloudflare: boolean; bindings?: WorkerBindings };
+  adminRuntime?: {
+    cloudflare: boolean;
+    bindings?: WorkerBindings;
+    waitUntil?: (task: Promise<unknown>) => void;
+  };
 };
 
 function getRequestRuntime(context: AdminRequestContext): {
@@ -42,7 +58,7 @@ function getRequestRuntime(context: AdminRequestContext): {
   return context.adminRuntime ?? { cloudflare: false };
 }
 
-function isProduction(context: AdminRequestContext): boolean {
+const isProduction = createServerOnlyFn((context: AdminRequestContext): boolean => {
   if (
     getRequestRuntime(context).cloudflare ||
     process.env["NODE_ENV"] === "production" ||
@@ -61,7 +77,7 @@ function isProduction(context: AdminRequestContext): boolean {
   } catch {
     return false;
   }
-}
+});
 
 function getSessionSecret(context: AdminRequestContext): string {
   const runtime = getRequestRuntime(context);
@@ -459,3 +475,43 @@ export const changeAdminPassword = createServerFn({ method: "POST" })
     await createSession(updated, context);
     return { ok: true as const };
   });
+
+export async function verifyAdminRequest(
+  request: Request,
+  context: AdminRequestContext,
+): Promise<{ authenticated: boolean; role?: string; username?: string }> {
+  const header = request.headers.get("cookie") ?? "";
+  const name = isProduction(context) ? COOKIE_NAME : DEV_COOKIE_NAME;
+  const value = header
+    .split(/;\s*/)
+    .find((item) => item.startsWith(name + "="))
+    ?.slice(name.length + 1);
+  if (!value) return { authenticated: false };
+  const [payload, encodedSignature, ...extra] = value.split(".");
+  if (!payload || !encodedSignature || extra.length) return { authenticated: false };
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(getSessionSecret(context)),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    const signature = new Uint8Array(base64UrlToBytes(encodedSignature));
+    const valid = await crypto.subtle.verify(
+      "HMAC",
+      key,
+      signature as unknown as BufferSource,
+      encoder.encode(payload),
+    );
+    if (!valid) return { authenticated: false };
+    const session = JSON.parse(new TextDecoder().decode(base64UrlToBytes(payload))) as AdminSession;
+    if (session.username !== "admin" || session.role !== "admin" || session.expiresAt <= Date.now())
+      return { authenticated: false };
+    const record = await readRecord(context);
+    if (!record || record.version !== session.version) return { authenticated: false };
+    return { authenticated: true, role: session.role, username: session.username };
+  } catch {
+    return { authenticated: false };
+  }
+}

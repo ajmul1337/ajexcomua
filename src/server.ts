@@ -71,8 +71,50 @@ export default {
       const cloudflare = isCloudflareExecutionContext(ctx);
       const bindings =
         cloudflare && env && typeof env === "object" ? (env as WorkerBindings) : undefined;
+      const requestContext = {
+        adminRuntime: bindings
+          ? {
+              cloudflare,
+              bindings,
+              ...(cloudflare
+                ? {
+                    waitUntil: (task: Promise<unknown>) =>
+                      (ctx as { waitUntil: (promise: Promise<unknown>) => void }).waitUntil(task),
+                  }
+                : {}),
+            }
+          : { cloudflare },
+      };
+      if (new URL(request.url).pathname.startsWith("/api/admin/import/")) {
+        const { handleAdminImportApi } = await import("./lib/price-import");
+        return await handleAdminImportApi(request, requestContext);
+      }
+      if (new URL(request.url).pathname.startsWith("/api/admin/source-updates")) {
+        const { handleAdminSourceUpdatesApi } = await import("./lib/source-updates");
+        return await handleAdminSourceUpdatesApi(request, requestContext);
+      }
+      if (new URL(request.url).pathname.startsWith("/api/admin/crosses/")) {
+        const { handleAdminCrossApi } = await import("./lib/crosses");
+        return await handleAdminCrossApi(request, requestContext);
+      }
+      if (new URL(request.url).pathname === "/api/products/offer") {
+        const { handleProductOfferApi } = await import("./lib/product-offers");
+        return await handleProductOfferApi(request, requestContext);
+      }
+      if (new URL(request.url).pathname === "/api/catalog/search") {
+        const { handleCatalogSearchApi } = await import("./lib/catalog");
+        return await handleCatalogSearchApi(request, requestContext);
+      }
+      if (new URL(request.url).pathname === "/api/catalog/vehicle") {
+        const { handleVehicleCatalogApi } = await import("./lib/vehicle-catalog");
+        return await handleVehicleCatalogApi(request, requestContext);
+      }
+      if (new URL(request.url).pathname === "/api/catalog/product") {
+        const { handleProductDetailApi } = await import("./lib/product-detail");
+        return await handleProductDetailApi(request, requestContext);
+      }
       const response = await handler.fetch(request, {
-        context: { adminRuntime: bindings ? { cloudflare, bindings } : { cloudflare } },
+        context: requestContext,
       });
       return await normalizeCatastrophicSsrResponse(response);
     } catch (error) {
@@ -82,5 +124,22 @@ export default {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
+  },
+  async scheduled(_controller: unknown, env: unknown, ctx: unknown) {
+    const cloudflare = isCloudflareExecutionContext(ctx);
+    const bindings =
+      cloudflare && env && typeof env === "object" ? (env as WorkerBindings) : undefined;
+    const requestContext = {
+      adminRuntime: bindings
+        ? {
+            cloudflare,
+            bindings,
+            waitUntil: (task: Promise<unknown>) =>
+              (ctx as { waitUntil: (promise: Promise<unknown>) => void }).waitUntil(task),
+          }
+        : { cloudflare },
+    };
+    const { enqueueDueSourceUpdates } = await import("./lib/source-updates");
+    await enqueueDueSourceUpdates(requestContext);
   },
 };

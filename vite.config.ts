@@ -8,6 +8,10 @@ import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 export default defineConfig({
   tanstackStart: {
+    // Use an explicit relative entry so production resolvers (including Vercel
+    // checkouts using a different TanStack Start patch version) resolve the
+    // tracked src/router.tsx file instead of relying on the `router` default.
+    router: { entry: "./router" },
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
     // nitro/vite builds from this
     server: { entry: "server" },

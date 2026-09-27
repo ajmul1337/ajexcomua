@@ -6,6 +6,7 @@ import { getAdminRequestStatus, type AdminRequestContext } from "@/lib/admin-aut
 
 const DEFAULT_PAGE_SIZE = 25;
 const MAX_PAGE_SIZE = 100;
+const SEARCH_MAX_RESULTS = 50;
 const cursorSchema = z.object({
   sort: z.string(),
   value: z.string(),
@@ -75,6 +76,194 @@ function getConnectionString(context: AdminRequestContext): string | undefined {
     process.env["POSTGRES_PRISMA_URL"] ??
     process.env["POSTGRES_URL_NON_POOLING"]
   );
+}
+
+const catalogSearchInput = z.object({
+  query: z.string().trim().min(1).max(120),
+  brandId: z.coerce.number().int().positive().optional(),
+  warehouseId: z.coerce.number().int().positive().optional(),
+  status: z.enum(["active", "draft", "archived"]).optional(),
+  limit: z.coerce.number().int().min(1).max(SEARCH_MAX_RESULTS).default(20),
+});
+
+type CatalogSearchRow = {
+  id: string;
+  brand_id: string;
+  brand_name: string;
+  article: string;
+  normalized_article: string;
+  name: string;
+  price: string;
+  stock: string;
+  status: string;
+  relevance: number;
+  matched_by: string;
+  cross_numbers: string[];
+};
+
+export const searchCatalog = createServerFn({ method: "GET" })
+  .validator(catalogSearchInput)
+  .handler(async ({ data, context }) => {
+    setResponseHeader("Cache-Control", "public, max-age=15, stale-while-revalidate=60");
+    const connectionString = getConnectionString(context);
+    if (!connectionString)
+      return {
+        configured: false as const,
+        items: [],
+        vehicles: [],
+        message: "Каталог временно недоступен.",
+      };
+    const normalized = normalizeArticle(data.query);
+    const params: unknown[] = [data.query, normalized];
+    const where: string[] = [];
+    const addParam = (value: unknown) => {
+      params.push(value);
+      return `$${params.length}`;
+    };
+    if (data.brandId) where.push(`p.brand_id=${addParam(data.brandId)}`);
+    if (data.status) where.push(`p.status=${addParam(data.status)}`);
+    if (data.warehouseId) {
+      const warehouse = addParam(data.warehouseId);
+      where.push(
+        `(p.warehouse_id=${warehouse} OR EXISTS (SELECT 1 FROM warehouse_products wp WHERE wp.product_id=p.id AND wp.warehouse_id=${warehouse}))`,
+      );
+    }
+    const limit = addParam(data.limit);
+    const sql = `
+      WITH candidates AS (
+        SELECT p.id,
+          CASE
+            WHEN p.normalized_article=$2 THEN 120
+            WHEN p.normalized_article LIKE $2 || '%' THEN 100
+            WHEN b.normalized_name=upper(btrim($1)) THEN 88
+            WHEN p.article ILIKE '%' || $1 || '%' THEN 78
+            WHEN p.name ILIKE '%' || $1 || '%' THEN 68
+            WHEN EXISTS (SELECT 1 FROM product_cross_numbers pcn JOIN cross_numbers cn ON cn.id=pcn.cross_number_id WHERE pcn.product_id=p.id AND (cn.normalized_article=$2 OR cn.normalized_article LIKE $2 || '%' OR cn.article ILIKE '%' || $1 || '%')) THEN 92
+            WHEN EXISTS (SELECT 1 FROM vehicle_compatibility vc JOIN vehicle_models vm ON vm.id=vc.model_id JOIN vehicle_makes vmake ON vmake.id=vm.make_id WHERE vc.product_id=p.id AND (vm.normalized_name ILIKE '%' || $1 || '%' OR vmake.normalized_name ILIKE '%' || $1 || '%')) THEN 74
+            ELSE 0
+          END AS relevance,
+          CASE
+            WHEN p.normalized_article=$2 THEN 'article_exact'
+            WHEN p.normalized_article LIKE $2 || '%' THEN 'article_prefix'
+            WHEN b.normalized_name=upper(btrim($1)) THEN 'brand'
+            WHEN EXISTS (SELECT 1 FROM product_cross_numbers pcn JOIN cross_numbers cn ON cn.id=pcn.cross_number_id WHERE pcn.product_id=p.id AND (cn.normalized_article=$2 OR cn.normalized_article LIKE $2 || '%' OR cn.article ILIKE '%' || $1 || '%')) THEN 'cross'
+            WHEN EXISTS (SELECT 1 FROM vehicle_compatibility vc JOIN vehicle_models vm ON vm.id=vc.model_id JOIN vehicle_makes vmake ON vmake.id=vm.make_id WHERE vc.product_id=p.id AND (vm.normalized_name ILIKE '%' || $1 || '%' OR vmake.normalized_name ILIKE '%' || $1 || '%')) THEN 'vehicle'
+            WHEN p.name ILIKE '%' || $1 || '%' THEN 'name'
+            ELSE 'article'
+          END AS matched_by
+        FROM products p JOIN brands b ON b.id=p.brand_id
+        WHERE (p.normalized_article LIKE $2 || '%' OR p.article ILIKE '%' || $1 || '%' OR b.normalized_name LIKE upper(btrim($1)) || '%' OR b.name ILIKE '%' || $1 || '%' OR p.name ILIKE '%' || $1 || '%'
+          OR EXISTS (SELECT 1 FROM product_cross_numbers pcn JOIN cross_numbers cn ON cn.id=pcn.cross_number_id WHERE pcn.product_id=p.id AND (cn.normalized_article LIKE $2 || '%' OR cn.article ILIKE '%' || $1 || '%'))
+          OR EXISTS (SELECT 1 FROM vehicle_compatibility vc JOIN vehicle_models vm ON vm.id=vc.model_id JOIN vehicle_makes vmake ON vmake.id=vm.make_id WHERE vc.product_id=p.id AND (vm.normalized_name ILIKE '%' || $1 || '%' OR vmake.normalized_name ILIKE '%' || $1 || '%')))
+          ${where.length ? `AND ${where.join(" AND ")}` : ""}
+        ORDER BY relevance DESC, p.stock DESC, p.updated_at DESC, p.id
+        LIMIT ${limit}
+      )
+      SELECT p.id::text, p.brand_id::text, b.name AS brand_name, p.article, p.normalized_article, p.name, p.price::text, p.stock::text, p.status, c.relevance, c.matched_by,
+        COALESCE((SELECT array_agg(limited.article ORDER BY limited.normalized_article) FROM (SELECT cn.article, cn.normalized_article FROM product_cross_numbers pcn JOIN cross_numbers cn ON cn.id=pcn.cross_number_id WHERE pcn.product_id=p.id ORDER BY cn.normalized_article LIMIT 12) limited), ARRAY[]::text[]) AS cross_numbers
+      FROM candidates c JOIN products p ON p.id=c.id JOIN brands b ON b.id=p.brand_id
+      ORDER BY c.relevance DESC,p.stock DESC,p.updated_at DESC,p.id`;
+    const client = new Client({
+      connectionString,
+      connectionTimeoutMillis: 5000,
+      query_timeout: 15000,
+    });
+    try {
+      await client.connect();
+      const result = await client.query<CatalogSearchRow>(sql, params);
+      const vehicles = await client.query(
+        `SELECT DISTINCT vmake.name AS make, vm.name AS model FROM vehicle_models vm JOIN vehicle_makes vmake ON vmake.id=vm.make_id WHERE vm.name ILIKE '%' || $1 || '%' OR vmake.name ILIKE '%' || $1 || '%' ORDER BY vmake.name,vm.name LIMIT 10`,
+        [data.query],
+      );
+      return {
+        configured: true as const,
+        items: result.rows,
+        vehicles: vehicles.rows,
+        message: null,
+      };
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  });
+
+export const autocompleteCatalog = createServerFn({ method: "GET" })
+  .validator(
+    z.object({
+      query: z.string().trim().min(1).max(80),
+      limit: z.coerce.number().int().min(1).max(10).default(8),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const connectionString = getConnectionString(context);
+    if (!connectionString) return { configured: false as const, items: [] };
+    const normalized = normalizeArticle(data.query);
+    const client = new Client({
+      connectionString,
+      connectionTimeoutMillis: 5000,
+      query_timeout: 5000,
+    });
+    try {
+      await client.connect();
+      const result = await client.query(
+        `SELECT p.id::text, b.name AS brand, p.article, p.name, p.normalized_article, 'product' AS kind FROM products p JOIN brands b ON b.id=p.brand_id WHERE p.normalized_article LIKE $1 || '%' OR b.normalized_name LIKE upper(btrim($2)) || '%' OR p.name ILIKE '%' || $2 || '%' OR EXISTS (SELECT 1 FROM product_cross_numbers pcn JOIN cross_numbers cn ON cn.id=pcn.cross_number_id WHERE pcn.product_id=p.id AND cn.normalized_article LIKE $1 || '%') ORDER BY (p.normalized_article=$1) DESC,(p.normalized_article LIKE $1 || '%') DESC,p.normalized_article,p.id LIMIT $3`,
+        [normalized, data.query, data.limit],
+      );
+      const vehicles = await client.query(
+        `SELECT vmake.name AS brand, vm.name AS model, 'vehicle' AS kind FROM vehicle_models vm JOIN vehicle_makes vmake ON vmake.id=vm.make_id WHERE vm.name ILIKE '%' || $1 || '%' OR vmake.name ILIKE '%' || $1 || '%' ORDER BY vmake.name,vm.name LIMIT $2`,
+        [data.query, Math.min(data.limit, 5)],
+      );
+      return {
+        configured: true as const,
+        items: [...result.rows, ...vehicles.rows].slice(0, data.limit),
+      };
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  });
+
+export async function handleCatalogSearchApi(
+  request: Request,
+  context: AdminRequestContext,
+): Promise<Response> {
+  const url = new URL(request.url);
+  if (url.pathname !== "/api/catalog/search" || request.method !== "GET")
+    return Response.json({ ok: false, error: "Маршрут не найден" }, { status: 404 });
+  const query = url.searchParams.get("q") ?? "";
+  const limit = Math.min(Number(url.searchParams.get("limit") ?? 20), SEARCH_MAX_RESULTS);
+  const parsed = catalogSearchInput.safeParse({
+    query,
+    limit: Number.isFinite(limit) ? limit : 20,
+  });
+  if (!parsed.success)
+    return Response.json({ ok: false, error: "Некорректный поисковый запрос" }, { status: 400 });
+  const connectionString = getConnectionString(context);
+  if (!connectionString)
+    return Response.json({ ok: false, error: "Каталог временно недоступен" }, { status: 503 });
+  const normalized = normalizeArticle(parsed.data.query);
+  const client = new Client({
+    connectionString,
+    connectionTimeoutMillis: 5000,
+    query_timeout: 15000,
+  });
+  try {
+    await client.connect();
+    const result = await client.query(
+      `
+      SELECT p.id::text, b.name AS brand, p.article, p.name, p.price::text, p.stock::text,
+        CASE WHEN p.normalized_article=$2 THEN 'article_exact' WHEN p.normalized_article LIKE $2 || '%' THEN 'article_prefix' WHEN b.normalized_name=upper(btrim($1)) THEN 'brand' ELSE 'text' END AS matched_by
+      FROM products p JOIN brands b ON b.id=p.brand_id
+      WHERE p.normalized_article LIKE $2 || '%' OR p.article ILIKE '%' || $1 || '%' OR b.normalized_name LIKE upper(btrim($1)) || '%' OR p.name ILIKE '%' || $1 || '%'
+        OR EXISTS (SELECT 1 FROM product_cross_numbers pcn JOIN cross_numbers cn ON cn.id=pcn.cross_number_id WHERE pcn.product_id=p.id AND (cn.normalized_article LIKE $2 || '%' OR cn.article ILIKE '%' || $1 || '%'))
+      ORDER BY (p.normalized_article=$2) DESC,(p.normalized_article LIKE $2 || '%') DESC,p.stock DESC,p.id LIMIT $3`,
+      [parsed.data.query, normalized, parsed.data.limit],
+    );
+    return Response.json(
+      { ok: true, items: result.rows },
+      { headers: { "cache-control": "public, max-age=15, stale-while-revalidate=60" } },
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
 }
 
 function getSortConfig(sort: z.infer<typeof listProductsInput>["sort"]) {
