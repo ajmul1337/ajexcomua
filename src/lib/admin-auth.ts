@@ -1,6 +1,6 @@
 import { createServerFn, createServerOnlyFn } from "@tanstack/react-start";
 import { getRequest, setResponseHeader } from "@tanstack/react-start/server";
-import { Client } from "pg";
+import type { Client as PgClient } from "pg";
 import { z } from "zod";
 
 const COOKIE_NAME = "__Host-ajex-admin";
@@ -194,7 +194,7 @@ function rowToRecord(row: AdminAccountRow): AdminRecord {
 
 async function withAuthDatabase<T>(
   context: AdminRequestContext,
-  action: (client: Client) => Promise<T>,
+  action: (client: PgClient) => Promise<T>,
 ): Promise<T> {
   const connectionString = getAuthDatabaseUrl(context);
   if (!connectionString) {
@@ -202,6 +202,10 @@ async function withAuthDatabase<T>(
       "Set DATABASE_URL, POSTGRES_URL, POSTGRES_PRISMA_URL, or POSTGRES_URL_NON_POOLING for admin authentication.",
     );
   }
+  // Keep the PostgreSQL driver behind the server function boundary. This module is
+  // also imported by browser routes for the RPC stubs, so a static `pg` import
+  // would pull Node's Buffer/process shims into the browser bundle.
+  const { Client } = await import("pg");
   const client = new Client({ connectionString, connectionTimeoutMillis: 10_000 });
   await client.connect();
   try {
