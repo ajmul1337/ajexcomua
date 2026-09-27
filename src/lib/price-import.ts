@@ -65,6 +65,33 @@ const MAX_LEGACY_XLS_BYTES = 50 * 1024 * 1024;
 const PREVIEW_ROWS = 25;
 const STORAGE_DIR = path.join(process.cwd(), "storage", "imports");
 const REQUIRED: PriceColumn[] = ["article", "brand"];
+const BLOB_PREFIX = "blob://";
+
+function isBlobPath(value: string): boolean {
+  return value.startsWith(BLOB_PREFIX);
+}
+
+function blobPath(value: string): string {
+  return value.slice(BLOB_PREFIX.length);
+}
+
+async function getVercelBlob(pathname: string) {
+  const { get } = await import("@vercel/blob");
+  const object = await get(pathname, { access: "private", useCache: false });
+  if (!object || object.statusCode !== 200)
+    throw new Error("Загруженный файл не найден в хранилище");
+  return object;
+}
+
+async function deleteVercelBlob(pathname: string): Promise<void> {
+  const { del } = await import("@vercel/blob");
+  await del(pathname);
+}
+
+async function getVercelBlobStream(pathname: string): Promise<Readable> {
+  const object = await getVercelBlob(pathname);
+  return Readable.fromWeb(object.stream as import("node:stream/web").ReadableStream);
+}
 
 function connectionString(context: AdminRequestContext): string | undefined {
   return (
@@ -331,6 +358,23 @@ async function* streamXlsxRows(inputFactory: () => Promise<Readable>): AsyncGene
   yield* parseXlsxWorksheet(await inputFactory(), shared);
 }
 async function detectCsvDelimiter(meta: UploadMeta, context: AdminRequestContext): Promise<string> {
+  if (isBlobPath(meta.filePath)) {
+    const input = await getVercelBlobStream(blobPath(meta.filePath));
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of input) {
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = Math.max(0, 64 * 1024 - bytes);
+      if (remaining === 0) break;
+      chunks.push(value.subarray(0, remaining));
+      bytes += Math.min(value.byteLength, remaining);
+      if (bytes >= 64 * 1024) break;
+    }
+    input.destroy();
+    return csvDelimiter(
+      iconv.decode(Buffer.concat(chunks), meta.encoding === "windows-1251" ? "win1251" : "utf8"),
+    );
+  }
   if (meta.filePath.startsWith("r2://")) {
     const object = await context.adminRuntime?.bindings?.IMPORTS_BUCKET?.get(
       meta.filePath.slice(5),
@@ -397,6 +441,9 @@ async function readMeta(id: string, context: AdminRequestContext): Promise<Uploa
     if (!object) throw new Error("Файл предпросмотра истёк или не найден");
     return JSON.parse(await object.text()) as UploadMeta;
   }
+  const blobMeta = await getVercelBlob(`imports/${path.basename(id)}.json`).catch(() => null);
+  if (blobMeta && blobMeta.statusCode === 200)
+    return JSON.parse(await new Response(blobMeta.stream).text()) as UploadMeta;
   const metaPath = path.join(STORAGE_DIR, `${path.basename(id)}.json`);
   return JSON.parse(await fsp.readFile(metaPath, "utf8")) as UploadMeta;
 }
@@ -410,6 +457,15 @@ async function writeMeta(
     await bucket.put(`imports/${id}.json`, JSON.stringify(meta));
     return;
   }
+  if (isBlobPath(meta.filePath)) {
+    const { put } = await import("@vercel/blob");
+    await put(`imports/${id}.json`, JSON.stringify(meta), {
+      access: "private",
+      addRandomSuffix: false,
+      allowOverwrite: true,
+    });
+    return;
+  }
   await fsp.writeFile(
     path.join(STORAGE_DIR, `${path.basename(id)}.json`),
     JSON.stringify(meta),
@@ -418,6 +474,9 @@ async function writeMeta(
 }
 
 async function importStream(meta: UploadMeta, context: AdminRequestContext): Promise<Readable> {
+  if (isBlobPath(meta.filePath)) {
+    return getVercelBlobStream(blobPath(meta.filePath));
+  }
   if (!meta.filePath.startsWith("r2://")) return fs.createReadStream(meta.filePath);
   const bucket = context.adminRuntime?.bindings?.IMPORTS_BUCKET;
   const object = await bucket?.get(meta.filePath.slice(5));
@@ -676,6 +735,7 @@ async function previewFile(
   const bucket = context.adminRuntime?.bindings?.IMPORTS_BUCKET;
   const objectKey = meta.filePath.startsWith("r2://") ? meta.filePath.slice(5) : null;
   const getStream = async () => {
+    if (isBlobPath(meta.filePath)) return getVercelBlobStream(blobPath(meta.filePath));
     if (!objectKey || !bucket) return fs.createReadStream(meta.filePath);
     const object = await bucket.get(objectKey);
     if (!object) throw new Error("Загруженный файл не найден в хранилище");
@@ -1217,7 +1277,9 @@ export async function executePriceImport(params: {
     await client.end();
     // Metadata is only needed during the upload/preview window. The source
     // file itself is retained server-side when retry is enabled.
-    if (params.meta.filePath.startsWith("r2://")) {
+    if (isBlobPath(params.meta.filePath)) {
+      await deleteVercelBlob(`imports/${params.meta.tempFileId}.json`).catch(() => undefined);
+    } else if (params.meta.filePath.startsWith("r2://")) {
       const bucket = params.context.adminRuntime?.bindings?.IMPORTS_BUCKET;
       await bucket?.delete(`imports/${params.meta.tempFileId}.json`).catch(() => undefined);
     } else {
@@ -1226,7 +1288,9 @@ export async function executePriceImport(params: {
         .catch(() => undefined);
     }
     if (!retainSourceForRetry) {
-      if (params.meta.filePath.startsWith("r2://")) {
+      if (isBlobPath(params.meta.filePath)) {
+        await deleteVercelBlob(blobPath(params.meta.filePath)).catch(() => undefined);
+      } else if (params.meta.filePath.startsWith("r2://")) {
         const bucket = params.context.adminRuntime?.bindings?.IMPORTS_BUCKET;
         await bucket?.delete(params.meta.filePath.slice(5)).catch(() => undefined);
       } else {
@@ -1315,7 +1379,16 @@ export async function handleAdminImportApi(
     const declaredSize = Number(request.headers.get("content-length") ?? 0);
     if (declaredSize > MAX_UPLOAD_BYTES)
       return Response.json({ ok: false, error: "Файл превышает лимит 250 МБ" }, { status: 413 });
-    const id = `imp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const generatedId = `imp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const blobPathHeader = request.headers.get("x-blob-path")?.trim();
+    const blobMatch = blobPathHeader?.match(/^imports\/(imp_[A-Za-z0-9]+_[^/]+)\.(csv|xlsx|xls)$/i);
+    const id = blobMatch?.[1] ?? generatedId;
+    const blobPathIsValid = !!blobMatch;
+    if (blobPathHeader && !blobPathIsValid)
+      return Response.json(
+        { ok: false, error: "Недействительный путь загруженного файла" },
+        { status: 400 },
+      );
     const bucket = context.adminRuntime?.bindings?.IMPORTS_BUCKET;
     if (context.adminRuntime?.cloudflare && !bucket)
       return Response.json(
@@ -1323,11 +1396,13 @@ export async function handleAdminImportApi(
         { status: 503 },
       );
     if (!bucket) await fsp.mkdir(STORAGE_DIR, { recursive: true });
-    const filePath = bucket
-      ? `r2://imports/${id}_${safeName(filename)}`
-      : path.join(STORAGE_DIR, `${id}_${safeName(filename)}`);
+    const filePath = blobPathIsValid
+      ? `${BLOB_PREFIX}${blobPathHeader}`
+      : bucket
+        ? `r2://imports/${id}_${safeName(filename)}`
+        : path.join(STORAGE_DIR, `${id}_${safeName(filename)}`);
     try {
-      await writeRequestBody(request, filePath, MAX_UPLOAD_BYTES, context);
+      if (!blobPathIsValid) await writeRequestBody(request, filePath, MAX_UPLOAD_BYTES, context);
     } catch (error) {
       if (error instanceof Response) return error;
       throw error;
@@ -1377,9 +1452,51 @@ export async function handleAdminImportApi(
     } finally {
       await client.end();
       if (!retained) {
-        if (bucket) await bucket.delete(filePath.slice(5)).catch(() => undefined);
+        if (isBlobPath(filePath)) await deleteVercelBlob(blobPath(filePath)).catch(() => undefined);
+        else if (bucket) await bucket.delete(filePath.slice(5)).catch(() => undefined);
         else await fsp.unlink(filePath).catch(() => undefined);
       }
+    }
+  }
+  if (pathname === "/api/admin/import/blob-token" && request.method === "POST") {
+    try {
+      const body = (await request.json()) as {
+        type?: string;
+        payload?: { pathname?: string; clientPayload?: string | null; multipart?: boolean };
+      };
+      const pathnameValue = body.payload?.pathname ?? "";
+      if (body.type !== "blob.generate-client-token")
+        throw new Error("Некорректный запрос загрузки файла");
+      if (!/^imports\/imp_[A-Za-z0-9]+_[^/]+\.(csv|xlsx|xls)$/i.test(pathnameValue))
+        throw new Error("Недействительное имя объекта импорта");
+      if (body.payload?.multipart !== true)
+        throw new Error("Для больших файлов требуется multipart upload");
+      const { generateClientTokenFromReadWriteToken } = await import("@vercel/blob/client");
+      const token = process.env["BLOB_READ_WRITE_TOKEN"];
+      if (!token) throw new Error("Vercel Blob не настроен: отсутствует BLOB_READ_WRITE_TOKEN");
+      const clientToken = await generateClientTokenFromReadWriteToken({
+        token,
+        pathname: pathnameValue,
+        allowedContentTypes: [
+          "text/csv",
+          "application/vnd.ms-excel",
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "application/octet-stream",
+        ],
+        maximumSizeInBytes: MAX_UPLOAD_BYTES,
+        addRandomSuffix: false,
+        allowOverwrite: false,
+        validUntil: Date.now() + 60 * 60 * 1000,
+      });
+      return Response.json({ type: body.type, clientToken });
+    } catch (error) {
+      return Response.json(
+        {
+          ok: false,
+          error: error instanceof Error ? error.message : "Не удалось подготовить загрузку файла",
+        },
+        { status: 400 },
+      );
     }
   }
   if (pathname === "/api/admin/import/start" && request.method === "POST") {
@@ -1406,6 +1523,10 @@ export async function handleAdminImportApi(
         { status: 409 },
       );
     if (
+      !(
+        isBlobPath(meta.filePath) &&
+        /^blob:\/\/imports\/imp_[A-Za-z0-9]+_[^/]+\.(csv|xlsx|xls)$/i.test(meta.filePath)
+      ) &&
       !(
         meta.filePath.startsWith(STORAGE_DIR) &&
         meta.filePath.includes(path.basename(body.tempFileId))

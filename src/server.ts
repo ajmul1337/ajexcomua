@@ -87,7 +87,18 @@ export default {
       };
       if (new URL(request.url).pathname.startsWith("/api/admin/import/")) {
         const { handleAdminImportApi } = await import("./lib/price-import");
-        return await handleAdminImportApi(request, requestContext);
+        try {
+          return await handleAdminImportApi(request, requestContext);
+        } catch (error) {
+          console.error(error);
+          return Response.json(
+            {
+              ok: false,
+              error: error instanceof Error ? error.message : "Сервер не смог обработать файл",
+            },
+            { status: error instanceof Response ? error.status : 500 },
+          );
+        }
       }
       if (new URL(request.url).pathname.startsWith("/api/admin/source-updates")) {
         const { handleAdminSourceUpdatesApi } = await import("./lib/source-updates");

@@ -62,9 +62,24 @@ async function triggerSourceUpdate(warehouseId: string): Promise<void> {
     `/api/admin/source-updates?warehouseId=${encodeURIComponent(warehouseId)}`,
     { method: "POST" },
   );
-  const body = (await response.json()) as { ok?: boolean; error?: string };
+  const body = await readJsonResponse<{ ok?: boolean; error?: string }>(response);
   if (!response.ok || !body.ok)
     throw new Error(body.error || "Не удалось поставить обновление в очередь");
+}
+
+async function readJsonResponse<T extends { error?: string }>(response: Response): Promise<T> {
+  const contentType = response.headers.get("content-type") ?? "";
+  const text = await response.text();
+  if (contentType.includes("application/json")) {
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error(`Сервер вернул некорректный JSON (HTTP ${response.status})`);
+    }
+  }
+  throw new Error(
+    text.trim() || `Сервер отклонил запрос (HTTP ${response.status}). Попробуйте ещё раз.`,
+  );
 }
 
 export const Route = createFileRoute("/admin/")({
@@ -2916,6 +2931,15 @@ function WarehouseImportSettings() {
     setMessage("");
     setPreview(null);
     try {
+      const { upload: uploadBlob } = await import("@vercel/blob/client");
+      const blobId = `imp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const blobPath = `imports/${blobId}_${file.name.replace(/[^\p{L}\p{N}._-]/gu, "_").slice(0, 180)}`;
+      const blob = await uploadBlob(blobPath, file, {
+        access: "private",
+        multipart: true,
+        handleUploadUrl: "/api/admin/import/blob-token",
+        onUploadProgress: () => undefined,
+      });
       const response = await fetch(
         `/api/admin/import/upload?warehouseId=${encodeURIComponent(selectedWarehouse.id)}`,
         {
@@ -2923,15 +2947,26 @@ function WarehouseImportSettings() {
           headers: {
             "content-type": "application/octet-stream",
             "x-file-name": encodeURIComponent(file.name),
+            "x-blob-path": blob.pathname,
           },
-          body: file,
+          body: JSON.stringify({}),
         },
       );
-      const result = await response.json();
+      const result = await readJsonResponse<{
+        ok?: boolean;
+        error?: string;
+        rows?: string[][];
+        mapping?: Record<string, string>;
+        format: string;
+        tempFileId: string;
+        estimatedRows: number;
+        errors?: string[];
+        safetyWarnings?: string[];
+      }>(response);
       if (!response.ok || !result.ok)
         throw new Error(result.error || "Не удалось обработать прайс");
-      const headers = firstRowHeaders ? (result.rows[0] ?? []) : [];
-      const rows = result.rows as string[][];
+      const rows = result.rows ?? [];
+      const headers = firstRowHeaders ? (rows[0] ?? []) : [];
       const dataRows = rows.slice(firstRowHeaders ? 1 : 0);
       const fields = importMappingFields.map((field) => {
         const selected = result.mapping?.[field.key] ?? mapping[field.key] ?? "";
