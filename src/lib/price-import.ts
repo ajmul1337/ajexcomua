@@ -1,4 +1,3 @@
-import { setResponseHeader } from "@tanstack/react-start/server";
 import { Client } from "pg";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -119,7 +118,6 @@ async function requireAdmin(
   request: Request,
   context: AdminRequestContext,
 ): Promise<{ username?: string }> {
-  setResponseHeader("Cache-Control", "private, no-store");
   const auth = await verifyAdminRequest(request, context);
   if (!auth.authenticated || auth.role !== "admin")
     throw new Response("Требуется авторизация администратора", { status: 401 });
