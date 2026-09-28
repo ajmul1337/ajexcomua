@@ -92,6 +92,11 @@ async function getVercelBlobStream(pathname: string): Promise<Readable> {
   return Readable.fromWeb(object.stream as import("node:stream/web").ReadableStream);
 }
 
+async function getVercelBlobArrayBuffer(pathname: string): Promise<ArrayBuffer> {
+  const object = await getVercelBlob(pathname);
+  return new Response(object.stream).arrayBuffer();
+}
+
 function connectionString(context: AdminRequestContext): string | undefined {
   return (
     context.adminRuntime?.bindings?.HYPERDRIVE?.connectionString ??
@@ -747,24 +752,31 @@ async function previewFile(
     }
     estimatedRows = Math.max(0, estimatedRows - (meta.firstRowHeaders ? 1 : 0));
   } else if (meta.format === "xls") {
-    if (!meta.filePath.startsWith("r2://")) {
+    let workbookInput: ArrayBuffer | string;
+    if (isBlobPath(meta.filePath)) {
+      workbookInput = await getVercelBlobArrayBuffer(blobPath(meta.filePath));
+      if (workbookInput.byteLength > MAX_LEGACY_XLS_BYTES)
+        throw new Error("XLS-файл больше 50 МБ: используйте XLSX или CSV для потокового импорта");
+    } else if (!meta.filePath.startsWith("r2://")) {
       const fileSize = (await fsp.stat(meta.filePath)).size;
       if (fileSize > MAX_LEGACY_XLS_BYTES)
         throw new Error("XLS-файл больше 50 МБ: используйте XLSX или CSV для потокового импорта");
+      workbookInput = meta.filePath;
     } else {
       const object = await bucket?.get(objectKey ?? "");
       const fileSize = Number((object as { size?: number } | null)?.size ?? 0);
       if (fileSize > MAX_LEGACY_XLS_BYTES)
         throw new Error("XLS-файл больше 50 МБ: используйте XLSX или CSV для потокового импорта");
+      workbookInput = (await object?.arrayBuffer()) ?? new ArrayBuffer(0);
     }
     const workbook =
-      objectKey && bucket
-        ? XLSX.read((await (await bucket.get(objectKey))?.arrayBuffer()) ?? new ArrayBuffer(0), {
+      typeof workbookInput === "string"
+        ? XLSX.readFile(workbookInput, { sheetRows: PREVIEW_ROWS + 1, raw: false })
+        : XLSX.read(workbookInput, {
             type: "array",
             sheetRows: PREVIEW_ROWS + 1,
             raw: false,
-          })
-        : XLSX.readFile(meta.filePath, { sheetRows: PREVIEW_ROWS + 1, raw: false });
+          });
     const sheet = workbook.Sheets[workbook.SheetNames[0] ?? ""];
     if (!sheet) throw new Error("В Excel-файле нет листов");
     const range = legacySheetInfo(sheet);
@@ -1096,7 +1108,12 @@ export async function executePriceImport(params: {
           await updateProgress(client, params.runId, counters);
       }
     } else if (params.meta.format === "xls") {
-      if (!params.meta.filePath.startsWith("r2://")) {
+      if (isBlobPath(params.meta.filePath)) {
+        const object = await getVercelBlob(blobPath(params.meta.filePath));
+        const fileSize = Number((object as { size?: number } | null)?.size ?? 0);
+        if (fileSize > MAX_LEGACY_XLS_BYTES)
+          throw new Error("XLS-файл больше 50 МБ: используйте XLSX или CSV для потокового импорта");
+      } else if (!params.meta.filePath.startsWith("r2://")) {
         const fileSize = (await fsp.stat(params.meta.filePath)).size;
         if (fileSize > MAX_LEGACY_XLS_BYTES)
           throw new Error("XLS-файл больше 50 МБ: используйте XLSX или CSV для потокового импорта");
@@ -1108,16 +1125,28 @@ export async function executePriceImport(params: {
         if (fileSize > MAX_LEGACY_XLS_BYTES)
           throw new Error("XLS-файл больше 50 МБ: используйте XLSX или CSV для потокового импорта");
       }
-      const workbook = params.meta.filePath.startsWith("r2://")
-        ? XLSX.read(
-            (await (
-              await params.context.adminRuntime?.bindings?.IMPORTS_BUCKET?.get(
-                params.meta.filePath.slice(5),
-              )
-            )?.arrayBuffer()) ?? new ArrayBuffer(0),
-            { type: "array", raw: false },
-          )
-        : XLSX.readFile(params.meta.filePath, { raw: false });
+      let workbookInput: ArrayBuffer | string;
+      if (isBlobPath(params.meta.filePath)) {
+        workbookInput = await getVercelBlobArrayBuffer(blobPath(params.meta.filePath));
+        if (workbookInput.byteLength > MAX_LEGACY_XLS_BYTES)
+          throw new Error("XLS-файл больше 50 МБ: используйте XLSX или CSV для потокового импорта");
+      } else if (params.meta.filePath.startsWith("r2://")) {
+        const object = await params.context.adminRuntime?.bindings?.IMPORTS_BUCKET?.get(
+          params.meta.filePath.slice(5),
+        );
+        workbookInput = (await object?.arrayBuffer()) ?? new ArrayBuffer(0);
+        if (workbookInput.byteLength > MAX_LEGACY_XLS_BYTES)
+          throw new Error("XLS-файл больше 50 МБ: используйте XLSX или CSV для потокового импорта");
+      } else {
+        const fileSize = (await fsp.stat(params.meta.filePath)).size;
+        if (fileSize > MAX_LEGACY_XLS_BYTES)
+          throw new Error("XLS-файл больше 50 МБ: используйте XLSX или CSV для потокового импорта");
+        workbookInput = params.meta.filePath;
+      }
+      const workbook =
+        typeof workbookInput === "string"
+          ? XLSX.readFile(workbookInput, { raw: false })
+          : XLSX.read(workbookInput, { type: "array", raw: false });
       const sheet = workbook.Sheets[workbook.SheetNames[0] ?? ""];
       const range = sheet ? legacySheetInfo(sheet) : null;
       const headers =
@@ -1393,7 +1422,7 @@ export async function handleAdminImportApi(
         { ok: false, error: "Для серверного импорта настройте R2 bucket binding IMPORTS_BUCKET." },
         { status: 503 },
       );
-    if (!bucket) await fsp.mkdir(STORAGE_DIR, { recursive: true });
+    if (!bucket && !blobPathIsValid) await fsp.mkdir(STORAGE_DIR, { recursive: true });
     const filePath = blobPathIsValid
       ? `${BLOB_PREFIX}${blobPathHeader}`
       : bucket
@@ -1730,7 +1759,14 @@ export async function handleAdminImportApi(
           { ok: false, error: "Формат исходного файла не поддерживается" },
           { status: 415 },
         );
-      if (meta.filePath.startsWith("r2://")) {
+      if (isBlobPath(meta.filePath)) {
+        const object = await getVercelBlob(blobPath(meta.filePath));
+        if (!object)
+          return Response.json(
+            { ok: false, error: "Файл больше не найден в хранилище" },
+            { status: 410 },
+          );
+      } else if (meta.filePath.startsWith("r2://")) {
         const object = await context.adminRuntime?.bindings?.IMPORTS_BUCKET?.get(
           meta.filePath.slice(5),
         );
