@@ -166,9 +166,11 @@ function stockValue(value: unknown): number | null {
     .trim()
     .toLowerCase();
   if (!raw) return null;
+  if (raw === ">9") return 10;
   if (["да", "есть", "в наличии", "много", "+", "yes"].includes(raw)) return 1;
   if (["нет", "-", "no", "под заказ"].includes(raw)) return 0;
-  const number = Number(raw.replace(/[^\d-]/g, ""));
+  if (!/^\d+(?:[.,]\d+)?$/.test(raw)) return null;
+  const number = Number(raw.replace(",", "."));
   return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
 }
 function leadTimeValue(value: unknown): number | null {
