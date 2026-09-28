@@ -3,6 +3,7 @@ import { setResponseHeader } from "@tanstack/react-start/server";
 import type { Client as PgClient } from "pg";
 import { z } from "zod";
 import { getAdminRequestStatus, type AdminRequestContext } from "@/lib/admin-auth";
+import type { PriceCurrency } from "@/lib/currency";
 
 const limitSchema = z.coerce.number().int().min(1).max(100).default(25);
 const pageSchema = z.object({
@@ -27,6 +28,7 @@ const emailSchema = z
   );
 const sourceTypes = ["api", "email", "manual_upload"] as const;
 const priceFormats = ["auto", "csv", "xlsx", "xls", "xml", "json", "custom"] as const;
+const priceCurrencies = ["UAH", "USD", "EUR"] as const;
 
 const supplierInput = z.object({
   id: idSchema.optional(),
@@ -38,6 +40,7 @@ const supplierInput = z.object({
 });
 
 const importSettingsSchema = z.object({
+  priceCurrency: z.enum(priceCurrencies).optional(),
   delimiter: z.enum(["auto", "comma", "semicolon", "tab"]).default("auto"),
   encoding: z.enum(["utf-8", "windows-1251"]).default("utf-8"),
   firstRowHeaders: z.boolean().default(true),
@@ -81,6 +84,7 @@ const warehouseInput = z.object({
     .optional()
     .default(""),
   priceFormat: z.enum(priceFormats).default("auto"),
+  priceCurrency: z.enum(priceCurrencies).default("UAH"),
   isActive: z.boolean().default(true),
   importSettings: importSettingsSchema.default({}),
   apiKey: z.string().max(2000).optional().default(""),
@@ -362,6 +366,7 @@ export const listAdminWarehouses = createServerFn({ method: "GET" })
         contact_email: string | null;
         api_url: string | null;
         price_format: (typeof priceFormats)[number];
+        price_currency: PriceCurrency | null;
         is_active: boolean;
         import_settings: z.infer<typeof importSettingsSchema>;
         auto_update_enabled: boolean;
@@ -385,7 +390,7 @@ export const listAdminWarehouses = createServerFn({ method: "GET" })
       }>(
         `
         SELECT w.id::text, w.name, w.supplier_id::text, s.name AS supplier_name,
-          w.source_type, w.contact_email, w.api_url, w.price_format, w.is_active,
+          w.source_type, w.contact_email, w.api_url, w.price_format, w.price_currency, w.is_active,
           w.import_settings, (w.source_credentials_ciphertext IS NOT NULL) AS has_credentials,
           w.auto_update_enabled, w.update_frequency, w.update_time, w.update_timezone, w.next_update_at, w.source_last_error,
           w.source_request_params, w.email_protocol, w.email_folder, w.email_from, w.email_subject, w.email_attachment_pattern, w.email_allowed_extensions,
@@ -471,9 +476,9 @@ export const saveAdminWarehouse = createServerFn({ method: "POST" })
       if (id) {
         await client.query(
           `UPDATE warehouses SET supplier_id=$2, name=$3, source_type=$4, contact_email=$5,
-            api_url=$6, price_format=$7, is_active=$8, import_settings=$9::jsonb,
-            status=$10, auto_update_enabled=$11, update_frequency=$12, update_time=$13::time, update_timezone=$14, source_request_params=$15::jsonb,
-            email_protocol=$16, email_folder=$17, email_from=$18, email_subject=$19, email_attachment_pattern=$20, email_allowed_extensions=$21, next_update_at=CASE WHEN $11 THEN COALESCE(next_update_at, now()) ELSE NULL END, updated_at=now() WHERE id=$1`,
+            api_url=$6, price_format=$7, price_currency=$8, is_active=$9, import_settings=$10::jsonb,
+            status=$11, auto_update_enabled=$12, update_frequency=$13, update_time=$14::time, update_timezone=$15, source_request_params=$16::jsonb,
+            email_protocol=$17, email_folder=$18, email_from=$19, email_subject=$20, email_attachment_pattern=$21, email_allowed_extensions=$22, next_update_at=CASE WHEN $12 THEN COALESCE(next_update_at, now()) ELSE NULL END, updated_at=now() WHERE id=$1`,
           [
             id,
             data.supplierId,
@@ -482,6 +487,7 @@ export const saveAdminWarehouse = createServerFn({ method: "POST" })
             data.email || null,
             data.apiUrl || null,
             data.priceFormat,
+            data.priceCurrency,
             data.isActive,
             JSON.stringify(importSettings),
             data.isActive ? "active" : "paused",
@@ -500,8 +506,8 @@ export const saveAdminWarehouse = createServerFn({ method: "POST" })
         );
       } else {
         const inserted = await client.query<{ id: string }>(
-          `INSERT INTO warehouses (supplier_id, name, source_type, contact_email, api_url, price_format, is_active, status, import_settings, auto_update_enabled, update_frequency, update_time, update_timezone, source_request_params, email_protocol, email_folder, email_from, email_subject, email_attachment_pattern, email_allowed_extensions, next_update_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::time,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,CASE WHEN $10 THEN now() ELSE NULL END) RETURNING id::text`,
+          `INSERT INTO warehouses (supplier_id, name, source_type, contact_email, api_url, price_format, price_currency, is_active, status, import_settings, auto_update_enabled, update_frequency, update_time, update_timezone, source_request_params, email_protocol, email_folder, email_from, email_subject, email_attachment_pattern, email_allowed_extensions, next_update_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13::time,$14,$15::jsonb,$16,$17,$18,$19,$20,$21,CASE WHEN $11 THEN now() ELSE NULL END) RETURNING id::text`,
           [
             data.supplierId,
             data.name,
@@ -509,6 +515,7 @@ export const saveAdminWarehouse = createServerFn({ method: "POST" })
             data.email || null,
             data.apiUrl || null,
             data.priceFormat,
+            data.priceCurrency,
             data.isActive,
             data.isActive ? "active" : "paused",
             JSON.stringify(importSettings),
@@ -577,8 +584,8 @@ export const saveWarehouseImportSettings = createServerFn({ method: "POST" })
     const client = await openClient(connectionString);
     try {
       const result = await client.query(
-        `UPDATE warehouses SET import_settings=$2::jsonb, updated_at=now() WHERE id=$1 RETURNING id`,
-        [data.id, JSON.stringify(data.importSettings)],
+        `UPDATE warehouses SET import_settings=$2::jsonb, price_currency=COALESCE($3, price_currency), updated_at=now() WHERE id=$1 RETURNING id`,
+        [data.id, JSON.stringify(data.importSettings), data.importSettings.priceCurrency ?? null],
       );
       if (!result.rowCount) return { ok: false as const, message: "Склад не найден." };
       await client.query(

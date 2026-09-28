@@ -48,6 +48,7 @@ export const listAdminProductOffers = createServerFn({ method: "GET" })
         SELECT p.id::text AS product_id, b.name AS brand, p.article,
           o.id::text AS offer_id, w.id::text AS warehouse_id, w.name AS warehouse,
           s.id::text AS supplier_id, s.name AS supplier, o.price::text, o.stock::text,
+          o.supplier_price::text, o.supplier_currency, o.exchange_rate::text,
           o.lead_time_days, o.supplier_article, o.status, o.updated_at
         FROM products p
         JOIN brands b ON b.id=p.brand_id
@@ -73,7 +74,8 @@ export const getBestProductOffer = createServerFn({ method: "GET" })
       const result = await client.query(
         `
         SELECT o.id::text AS offer_id, p.id::text AS product_id, b.name AS brand, p.article,
-          o.price::text, o.stock::text, o.lead_time_days, o.supplier_article,
+          o.price::text, o.stock::text, o.supplier_price::text, o.supplier_currency, o.exchange_rate::text,
+          o.lead_time_days, o.supplier_article,
           w.name AS warehouse, s.name AS supplier, o.updated_at
         FROM products p
         JOIN brands b ON b.id=p.brand_id
@@ -110,8 +112,8 @@ export async function handleProductOfferApi(
   try {
     const result = await client.query(
       `
-      SELECT o.id::text AS offer_id, p.id::text AS product_id, b.name AS brand, p.article,
-        o.price::text, o.stock::text, o.lead_time_days, o.supplier_article, w.name AS warehouse, s.name AS supplier
+        SELECT o.id::text AS offer_id, p.id::text AS product_id, b.name AS brand, p.article,
+        o.price::text, o.stock::text, o.supplier_price::text, o.supplier_currency, o.exchange_rate::text, o.lead_time_days, o.supplier_article, w.name AS warehouse, s.name AS supplier
       FROM products p JOIN brands b ON b.id=p.brand_id JOIN product_offers o ON o.product_id=p.id
       JOIN warehouses w ON w.id=o.warehouse_id LEFT JOIN suppliers s ON s.id=o.supplier_id
       WHERE b.normalized_name=upper(btrim($1)) AND p.normalized_article=normalize_part_article($2)

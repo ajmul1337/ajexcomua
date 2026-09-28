@@ -78,7 +78,7 @@ export const getAdminProduct = createServerFn({ method: "GET" })
             [data.id],
           ),
           client.query(
-            `SELECT o.id::text,w.name AS warehouse,s.name AS supplier,o.price::text,o.stock::text,o.lead_time_days,o.supplier_article,o.status,o.updated_at FROM product_offers o JOIN warehouses w ON w.id=o.warehouse_id LEFT JOIN suppliers s ON s.id=o.supplier_id WHERE o.product_id=$1 ORDER BY o.updated_at DESC`,
+            `SELECT o.id::text,w.name AS warehouse,s.name AS supplier,o.price::text,o.stock::text,o.supplier_price::text,o.supplier_currency,o.exchange_rate::text,o.lead_time_days,o.supplier_article,o.status,o.updated_at FROM product_offers o JOIN warehouses w ON w.id=o.warehouse_id LEFT JOIN suppliers s ON s.id=o.supplier_id WHERE o.product_id=$1 ORDER BY o.updated_at DESC`,
             [data.id],
           ),
           client.query(

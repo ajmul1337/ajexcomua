@@ -56,6 +56,7 @@ import {
   saveAdminWarehouse,
   saveWarehouseImportSettings,
 } from "@/lib/supplier-warehouse";
+import { listExchangeRates, saveExchangeRates } from "@/lib/currency";
 
 async function triggerSourceUpdate(warehouseId: string): Promise<void> {
   const response = await fetch(
@@ -184,6 +185,12 @@ const sections = [
     label: "Настройки",
     icon: Settings,
     description: "Основные настройки магазина и панели.",
+  },
+  {
+    id: "currencies",
+    label: "Валюты и курсы",
+    icon: Gauge,
+    description: "Ручные курсы валют для расчёта цен прайс-листов.",
   },
   {
     id: "users",
@@ -426,6 +433,8 @@ function AdminDashboardPage() {
               <WarehouseImportSettings />
             ) : activeSection === "import-history" ? (
               <ImportHistorySection />
+            ) : activeSection === "currencies" ? (
+              <CurrencyRatesManager />
             ) : (
               <div className="rounded-xl border border-border bg-card p-6 shadow-sm sm:p-10">
                 <div className="mx-auto flex max-w-lg flex-col items-center text-center">
@@ -1631,9 +1640,96 @@ type WarehouseRow = {
   email_subject: string | null;
   email_attachment_pattern: string | null;
   email_allowed_extensions: string[];
+  price_currency: "UAH" | "USD" | "EUR" | null;
 };
 
 type SupplierOption = { id: string; name: string };
+
+function CurrencyRatesManager() {
+  const [usd, setUsd] = useState("43.50");
+  const [eur, setEur] = useState("51.00");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void listExchangeRates()
+      .then((result) => {
+        setUsd(result.rates.USD);
+        setEur(result.rates.EUR);
+      })
+      .catch(() => setError("Не удалось загрузить курсы. Проверьте подключение к базе."))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true);
+    setMessage("");
+    setError("");
+    try {
+      const result = await saveExchangeRates({ data: { rates: { USD: usd, EUR: eur } } });
+      if (!result.ok) {
+        setError(result.message);
+        return;
+      }
+      setUsd(result.rates.USD);
+      setEur(result.rates.EUR);
+      setMessage("Курсы сохранены.");
+    } catch {
+      setError("Не удалось сохранить курсы.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <form onSubmit={save} className="rounded-xl border border-border bg-card p-5 shadow-sm sm:p-6">
+      <div className="grid gap-4 sm:grid-cols-3">
+        <label className="grid gap-1 text-sm font-semibold">
+          USD → UAH
+          <input
+            value={loading ? "" : usd}
+            onChange={(event) => setUsd(event.target.value)}
+            inputMode="decimal"
+            className="h-10 rounded-lg border border-input bg-background px-3 font-normal"
+          />
+        </label>
+        <label className="grid gap-1 text-sm font-semibold">
+          EUR → UAH
+          <input
+            value={loading ? "" : eur}
+            onChange={(event) => setEur(event.target.value)}
+            inputMode="decimal"
+            className="h-10 rounded-lg border border-input bg-background px-3 font-normal"
+          />
+        </label>
+        <label className="grid gap-1 text-sm font-semibold">
+          UAH → UAH
+          <input
+            value="1.00"
+            readOnly
+            className="h-10 rounded-lg border border-input bg-muted px-3 font-normal"
+          />
+        </label>
+      </div>
+      <button
+        type="submit"
+        disabled={loading || saving}
+        className="mt-4 inline-flex h-10 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-extrabold text-primary-foreground disabled:opacity-60"
+      >
+        <Save className="size-4" /> {saving ? "Сохраняем…" : "Сохранить курсы"}
+      </button>
+      {message && <p className="mt-3 text-sm text-success">{message}</p>}
+      {error && (
+        <p role="alert" className="mt-3 text-sm text-destructive">
+          {error}
+        </p>
+      )}
+    </form>
+  );
+}
 
 function SupplierManager() {
   const [items, setItems] = useState<SupplierRow[]>([]);
@@ -1921,6 +2017,7 @@ type WarehouseForm = {
   email: string;
   apiUrl: string;
   priceFormat: "auto" | "csv" | "xlsx" | "xls" | "xml" | "json" | "custom";
+  priceCurrency: "UAH" | "USD" | "EUR";
   isActive: boolean;
   importSettings: {
     delimiter: "auto" | "comma" | "semicolon" | "tab";
@@ -1953,6 +2050,7 @@ function emptyWarehouseForm(): WarehouseForm {
     email: "",
     apiUrl: "",
     priceFormat: "auto",
+    priceCurrency: "UAH",
     isActive: true,
     importSettings: {
       delimiter: "auto",
@@ -2057,6 +2155,7 @@ function WarehouseManager() {
     initial.email = warehouse.contact_email ?? "";
     initial.apiUrl = warehouse.api_url ?? "";
     initial.priceFormat = warehouse.price_format as WarehouseForm["priceFormat"];
+    initial.priceCurrency = warehouse.price_currency ?? "UAH";
     initial.isActive = warehouse.is_active;
     initial.autoUpdateEnabled = warehouse.auto_update_enabled;
     initial.updateFrequency = warehouse.update_frequency as WarehouseForm["updateFrequency"];
@@ -2282,6 +2381,20 @@ function WarehouseManager() {
                 <option value="xml">XML</option>
                 <option value="json">JSON</option>
                 <option value="custom">Другой формат</option>
+              </select>
+            </label>
+            <label className="grid gap-1 text-sm font-semibold">
+              Валюта прайс-листа
+              <select
+                value={form.priceCurrency}
+                onChange={(event) =>
+                  setField("priceCurrency", event.target.value as WarehouseForm["priceCurrency"])
+                }
+                className="h-10 rounded-lg border border-input bg-background px-3 font-normal"
+              >
+                <option value="UAH">UAH</option>
+                <option value="USD">USD</option>
+                <option value="EUR">EUR</option>
               </select>
             </label>
           </div>
@@ -2748,7 +2861,10 @@ const importMappingFields = [
   { key: "category", label: "Категория", required: false },
 ] as const;
 
-type ImportWarehouse = Pick<WarehouseRow, "id" | "name" | "price_format" | "import_settings">;
+type ImportWarehouse = Pick<
+  WarehouseRow,
+  "id" | "name" | "price_format" | "price_currency" | "import_settings"
+>;
 type ImportPreview = {
   rows: string[][];
   fields: { key: string; label: string; column: string; sample: string }[];
@@ -2771,6 +2887,8 @@ function WarehouseImportSettings() {
   const [encoding, setEncoding] = useState<"utf-8" | "windows-1251">("utf-8");
   const [firstRowHeaders, setFirstRowHeaders] = useState(true);
   const [deleteMissing, setDeleteMissing] = useState(false);
+  const [priceCurrency, setPriceCurrency] = useState<"UAH" | "USD" | "EUR">("UAH");
+  const [exchangeRates, setExchangeRates] = useState({ UAH: "1.00", USD: "43.50", EUR: "51.00" });
   const [safetyConfirmed, setSafetyConfirmed] = useState(false);
   const [columnStyle, setColumnStyle] = useState<"letters" | "numbers">("numbers");
   const [file, setFile] = useState<File | null>(null);
@@ -2798,6 +2916,12 @@ function WarehouseImportSettings() {
     { id: string; row_number: number; raw_value: string | null; message: string }[]
   >([]);
   const [startingImport, setStartingImport] = useState(false);
+
+  useEffect(() => {
+    void listExchangeRates()
+      .then((result) => setExchangeRates(result.rates))
+      .catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -2843,6 +2967,7 @@ function WarehouseImportSettings() {
     setEncoding((settings?.encoding as typeof encoding) ?? "utf-8");
     setFirstRowHeaders(settings?.firstRowHeaders ?? true);
     setDeleteMissing(settings?.deleteMissing ?? false);
+    setPriceCurrency(warehouse?.price_currency ?? "UAH");
     setSafetyConfirmed(false);
     setExtraKeys(
       Object.keys(settings?.columnMapping ?? {}).filter(
@@ -2880,6 +3005,7 @@ function WarehouseImportSettings() {
         data: {
           id: selectedWarehouse.id,
           importSettings: {
+            priceCurrency,
             delimiter,
             encoding,
             firstRowHeaders,
@@ -2899,6 +3025,7 @@ function WarehouseImportSettings() {
             ? {
                 ...warehouse,
                 import_settings: {
+                  priceCurrency,
                   delimiter,
                   encoding,
                   firstRowHeaders,
@@ -3012,6 +3139,11 @@ function WarehouseImportSettings() {
 
   const startImport = async () => {
     if (!preview?.tempFileId || !selectedWarehouse) return;
+    const rate = exchangeRates[priceCurrency];
+    if (!rate) {
+      setError("Не удалось получить курс выбранной валюты.");
+      return;
+    }
     setStartingImport(true);
     setError("");
     try {
@@ -3021,6 +3153,7 @@ function WarehouseImportSettings() {
         body: JSON.stringify({
           tempFileId: preview.tempFileId,
           warehouseId: selectedWarehouse.id,
+          priceCurrency,
           confirmSafety: safetyConfirmed,
         }),
       });
@@ -3155,6 +3288,21 @@ function WarehouseImportSettings() {
                 >
                   <option value="numbers">CSV / разделитель · 1, 2, 3…</option>
                   <option value="letters">Excel · A, B, C…</option>
+                </select>
+              </label>
+              <label className="grid gap-1 text-sm font-semibold">
+                Валюта прайс-листа
+                <select
+                  value={priceCurrency}
+                  onChange={(event) => {
+                    setPriceCurrency(event.target.value as typeof priceCurrency);
+                    setPreview(null);
+                  }}
+                  className="h-10 rounded-lg border border-input bg-background px-3 font-normal"
+                >
+                  <option value="UAH">UAH</option>
+                  <option value="USD">USD</option>
+                  <option value="EUR">EUR</option>
                 </select>
               </label>
               <label className="grid gap-1 text-sm font-semibold">
@@ -3320,6 +3468,20 @@ function WarehouseImportSettings() {
                 {columnStyle === "letters" ? "Excel: буквенные колонки" : "CSV: колонки по номеру"}
               </p>
             )}
+            <div className="rounded-lg border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950">
+              <p>Валюта прайса: {priceCurrency}</p>
+              <p>
+                Курс: {exchangeRates[priceCurrency]} грн/{priceCurrency}
+              </p>
+              <p className="mt-1 font-semibold">
+                100 {priceCurrency} × {exchangeRates[priceCurrency]} ={" "}
+                {(100 * Number(exchangeRates[priceCurrency])).toFixed(2)} грн
+              </p>
+              <p className="mt-1">
+                Проверьте валюту и курс перед импортом. Эти параметры будут использованы при расчёте
+                цен.
+              </p>
+            </div>
           </section>
         </>
       )}

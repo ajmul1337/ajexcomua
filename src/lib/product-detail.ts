@@ -69,7 +69,7 @@ async function fetchProduct(data: z.infer<typeof productInput>, context: AdminRe
         [id],
       ),
       client.query(
-        `SELECT o.id::text AS id,w.name AS warehouse,s.name AS supplier,o.price::text,o.stock::text,o.lead_time_days,o.supplier_article,o.status,o.updated_at FROM product_offers o JOIN warehouses w ON w.id=o.warehouse_id LEFT JOIN suppliers s ON s.id=o.supplier_id WHERE o.product_id=$1 ORDER BY (o.status='active' AND o.stock>0) DESC,o.price ASC,o.lead_time_days NULLS LAST,o.updated_at DESC`,
+        `SELECT o.id::text AS id,w.name AS warehouse,s.name AS supplier,o.price::text,o.stock::text,o.supplier_price::text,o.supplier_currency,o.exchange_rate::text,o.lead_time_days,o.supplier_article,o.status,o.updated_at FROM product_offers o JOIN warehouses w ON w.id=o.warehouse_id LEFT JOIN suppliers s ON s.id=o.supplier_id WHERE o.product_id=$1 ORDER BY (o.status='active' AND o.stock>0) DESC,o.price ASC,o.lead_time_days NULLS LAST,o.updated_at DESC`,
         [id],
       ),
       client.query(

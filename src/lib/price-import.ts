@@ -10,6 +10,7 @@ import iconv from "iconv-lite";
 import unzipper from "unzipper";
 import sax from "sax";
 import { verifyAdminRequest, type AdminRequestContext } from "@/lib/admin-auth";
+import { resolveExchangeRate, type PriceCurrency } from "@/lib/currency";
 import {
   detectPriceColumns,
   detectPriceFormat,
@@ -17,7 +18,8 @@ import {
   type PriceColumnMapping,
 } from "@/lib/price-format";
 
-export type ImportStatus = "queued" | "running" | "completed" | "completed_with_errors" | "failed";
+export type ImportStatus =
+  "queued" | "preparing" | "running" | "completed" | "completed_with_errors" | "failed";
 export type ImportRun = {
   id: string;
   filename: string;
@@ -42,6 +44,9 @@ export type ImportRun = {
   durationMs: number | null;
   summary: string | null;
   columnMapping: PriceColumnMapping | null;
+  priceCurrency: PriceCurrency | null;
+  exchangeRate: string | null;
+  exchangeRateSource: "manual" | null;
   createdAt: string;
 };
 export type ImportError = {
@@ -142,9 +147,7 @@ function normalizeArticle(value: string): string {
 function normalizeBrand(value: string): string {
   return value.normalize("NFKC").trim().toUpperCase();
 }
-function numberValue(value: unknown): number | null {
-  if (typeof value === "number")
-    return Number.isFinite(value) && value >= 0 ? Math.round(value * 100) / 100 : null;
+function numberValue(value: unknown): string | null {
   const raw = String(value ?? "")
     .trim()
     .toLowerCase();
@@ -153,8 +156,10 @@ function numberValue(value: unknown): number | null {
     .replace(/[\s\u00a0]/g, "")
     .replace(/[₴$€₽]|грн|uah|rub|eur|usd/gi, "")
     .replace(/,/g, ".");
-  const number = Number(cleaned);
-  return Number.isFinite(number) && number >= 0 ? Math.round(number * 100) / 100 : null;
+  if (!/^\d+(?:\.\d+)?$/.test(cleaned)) return null;
+  const [whole, fraction = ""] = cleaned.split(".");
+  if (fraction.length > 6) return null;
+  return `${(whole ?? "0").replace(/^0+(?=\d)/, "")}.${fraction.padEnd(2, "0")}`;
 }
 function stockValue(value: unknown): number | null {
   const raw = String(value ?? "")
@@ -356,7 +361,9 @@ async function* parseXlsxWorksheet(
     break;
   }
 }
-async function* streamXlsxRows(inputFactory: () => Promise<Readable>): AsyncGenerator<XlsxRow> {
+export async function* streamXlsxRows(
+  inputFactory: () => Promise<Readable>,
+): AsyncGenerator<XlsxRow> {
   const shared = await readXlsxSharedStrings(await inputFactory());
   yield* parseXlsxWorksheet(await inputFactory(), shared);
 }
@@ -407,7 +414,7 @@ async function detectCsvDelimiter(meta: UploadMeta, context: AdminRequestContext
   );
 }
 
-type UploadMeta = {
+export type UploadMeta = {
   tempFileId: string;
   filePath: string;
   filename: string;
@@ -423,6 +430,9 @@ type UploadMeta = {
   safetyConfirmationRequired?: boolean;
   deleteMissing?: boolean;
   validationErrors?: string[];
+  priceCurrency?: PriceCurrency;
+  exchangeRate?: string;
+  exchangeRateSource?: "manual";
 };
 export type ServerSourceFile = {
   warehouseId: string;
@@ -436,6 +446,7 @@ type WarehouseImportSettings = {
   firstRowHeaders?: boolean;
   columnMapping?: PriceColumnMapping;
   deleteMissing?: boolean;
+  priceCurrency?: PriceCurrency;
 };
 async function readMeta(id: string, context: AdminRequestContext): Promise<UploadMeta> {
   const bucket = context.adminRuntime?.bindings?.IMPORTS_BUCKET;
@@ -476,7 +487,10 @@ async function writeMeta(
   );
 }
 
-async function importStream(meta: UploadMeta, context: AdminRequestContext): Promise<Readable> {
+export async function importStream(
+  meta: UploadMeta,
+  context: AdminRequestContext,
+): Promise<Readable> {
   if (isBlobPath(meta.filePath)) {
     return getVercelBlobStream(blobPath(meta.filePath));
   }
@@ -500,8 +514,9 @@ async function warehouseSettings(
     supplier_id: string | null;
     supplier_name: string | null;
     import_settings: WarehouseImportSettings | null;
+    price_currency: PriceCurrency | null;
   }>(
-    `SELECT w.name, w.supplier_id::text, s.name AS supplier_name, w.import_settings FROM warehouses w LEFT JOIN suppliers s ON s.id=w.supplier_id WHERE w.id=$1 AND w.is_active=true`,
+    `SELECT w.name, w.supplier_id::text, s.name AS supplier_name, w.import_settings, w.price_currency FROM warehouses w LEFT JOIN suppliers s ON s.id=w.supplier_id WHERE w.id=$1 AND w.is_active=true`,
     [warehouseId],
   );
   const row = result.rows[0];
@@ -510,7 +525,9 @@ async function warehouseSettings(
     name: row.name,
     supplierId: row.supplier_id,
     supplierName: row.supplier_name,
-    settings: row.import_settings ?? {},
+    settings: row.price_currency
+      ? { ...(row.import_settings ?? {}), priceCurrency: row.price_currency }
+      : (row.import_settings ?? {}),
   };
 }
 
@@ -560,6 +577,9 @@ export async function queueServerSourceImport(
     if (format !== "csv" && format !== "xlsx" && format !== "xls")
       throw new Error("Поддерживаются CSV, XLSX и XLS");
     const settings = warehouse.settings;
+    const priceCurrency = settings.priceCurrency;
+    if (!priceCurrency) throw new Error("Укажите валюту прайс-листа для склада");
+    const exchangeRate = await resolveExchangeRate(context, priceCurrency);
     const meta: UploadMeta = {
       tempFileId: `src_${Date.now()}_${Math.random().toString(36).slice(2)}`,
       filePath: sourceFile.filePath,
@@ -573,6 +593,9 @@ export async function queueServerSourceImport(
       estimatedRows: 0,
       retainForRetry: true,
       deleteMissing: settings.deleteMissing === true,
+      priceCurrency,
+      exchangeRate,
+      exchangeRateSource: "manual",
     };
     const preview = await previewFile(meta, context);
     meta.estimatedRows = preview.estimatedRows;
@@ -620,8 +643,8 @@ export async function queueServerSourceImport(
       throw new Error(meta.safetyWarnings.join(" "));
     }
     const result = await client.query<{ id: string }>(
-      `INSERT INTO import_runs(filename,source,status,warehouse_id,supplier_id,column_mapping,rows_total,started_by,source_file_path,source_metadata,safety_warnings,safety_confirmed_at)
-       VALUES($1,$2,'queued',$3,$6,$4::jsonb,$5,'system:auto-update',$7,$8::jsonb,$9::jsonb,CASE WHEN $10 THEN now() ELSE NULL END) RETURNING id::text`,
+      `INSERT INTO import_runs(filename,source,status,warehouse_id,supplier_id,column_mapping,rows_total,started_by,source_file_path,price_currency,exchange_rate,exchange_rate_source,source_metadata,safety_warnings,safety_confirmed_at)
+       VALUES($1,$2,'queued',$3,$6,$4::jsonb,$5,'system:auto-update',$7,$11,$12::numeric,'manual',$8::jsonb,$9::jsonb,CASE WHEN $10 THEN now() ELSE NULL END) RETURNING id::text`,
       [
         meta.filename,
         sourceFile.source,
@@ -634,28 +657,44 @@ export async function queueServerSourceImport(
           format: meta.format,
           encoding: meta.encoding,
           delimiter: meta.delimiter,
+          headers: meta.headers,
           firstRowHeaders: meta.firstRowHeaders,
           mapping: meta.mapping,
           tempFileId: meta.tempFileId,
           deleteMissing: meta.deleteMissing === true,
           safetyWarnings: meta.safetyWarnings ?? [],
           validationErrors: meta.validationErrors ?? [],
+          priceCurrency,
+          exchangeRate,
+          exchangeRateSource: "manual",
         }),
         JSON.stringify(meta.safetyWarnings ?? []),
         (meta.safetyWarnings ?? []).length === 0,
+        priceCurrency,
+        exchangeRate,
       ],
     );
     const runId = result.rows[0]?.id;
     if (!runId) throw new Error("Не удалось создать импорт");
-    const task = executePriceImport({
-      runId,
-      meta,
+    const { createProcessingSnapshot } = await import("@/lib/import-jobs");
+    await createProcessingSnapshot(client, runId, {
       warehouseId: sourceFile.warehouseId,
-      context,
+      supplierId: warehouse.supplierId,
+      filename: meta.filename,
+      sourceFilePath: meta.filePath,
+      format: meta.format,
+      headers: meta.headers,
+      mapping: meta.mapping,
+      delimiter: meta.delimiter,
+      encoding: meta.encoding,
+      firstRowHeaders: meta.firstRowHeaders,
+      deleteMissing: meta.deleteMissing === true,
+      priceCurrency,
+      exchangeRate,
+      exchangeRateSource: "manual",
       startedBy: "system:auto-update",
+      estimatedRows: meta.estimatedRows,
     });
-    if (context.adminRuntime?.waitUntil) context.adminRuntime.waitUntil(task);
-    else setImmediate(() => void task);
     return runId;
   } finally {
     await client.end();
@@ -790,6 +829,7 @@ async function previewFile(
     estimatedRows = Math.max(0, range.e.r - range.s.r + 1 - (meta.firstRowHeaders ? 1 : 0));
   } else {
     const delimiter = meta.delimiter || (await detectCsvDelimiter(meta, context));
+    meta.delimiter = delimiter;
     const input = (await getStream()).pipe(
       iconv.decodeStream(meta.encoding === "windows-1251" ? "win1251" : "utf8"),
     );
@@ -803,6 +843,7 @@ async function previewFile(
     estimatedRows = Math.max(0, estimatedRows - (meta.firstRowHeaders ? 1 : 0));
   }
   const headers = meta.firstRowHeaders ? (rows[0] ?? []) : [];
+  meta.headers = headers;
   if (meta.firstRowHeaders) {
     const detected = detectPriceColumns(headers, meta.mapping);
     meta.mapping = { ...detected, ...meta.mapping };
@@ -836,7 +877,7 @@ function valueAt(row: string[], headers: string[], field: string | undefined): s
   return index >= 0 ? (row[index] ?? "") : "";
 }
 
-type Counters = {
+export type Counters = {
   rowsTotal: number;
   rowsProcessed: number;
   rowsCreated: number;
@@ -859,7 +900,7 @@ async function saveError(
   );
 }
 
-async function processRow(
+export async function processRow(
   client: Client,
   runId: string,
   warehouseId: string,
@@ -870,6 +911,8 @@ async function processRow(
   rowNumber: number,
   seen: Set<string>,
   counters: Counters,
+  priceCurrency: PriceCurrency,
+  exchangeRate: string,
 ): Promise<void> {
   counters.rowsProcessed += 1;
   const articleRaw = valueAt(row, headers, mapping["article"]);
@@ -900,8 +943,12 @@ async function processRow(
   const supplierArticleRaw = valueAt(row, headers, mapping["supplier_article"]) || articleRaw;
   const leadTimeRaw = valueAt(row, headers, mapping["lead_time"]);
   const oemRaw = valueAt(row, headers, mapping["oem"]);
-  const price = mapping["price"] ? numberValue(priceRaw) : 0;
-  const stock = mapping["stock"] ? stockValue(stockRaw) : 0;
+  const price = mapping["price"] ? numberValue(priceRaw) : "0.00";
+  const stock = mapping["stock"]
+    ? stockRaw.trim()
+      ? stockValue(stockRaw)
+      : 0
+    : 0;
   const leadTime = leadTimeRaw ? leadTimeValue(leadTimeRaw) : null;
   if (mapping["price"] && price === null) {
     counters.rowsSkipped += 1;
@@ -952,8 +999,18 @@ async function processRow(
     const articleId = articleResult.rows[0]?.id;
     if (!articleId) throw new Error("Не удалось определить артикул");
     const product = await client.query<{ id: string; is_new: boolean }>(
-      `INSERT INTO products (brand_id,article_id,article,name,price,stock,warehouse_id,supplier_id,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active') ON CONFLICT (brand_id,normalized_article) DO UPDATE SET name=CASE WHEN products.name='' THEN EXCLUDED.name ELSE products.name END,updated_at=now() RETURNING id::text,(xmax=0) AS is_new`,
-      [brandId, articleId, articleRaw, name, price ?? 0, stock ?? 0, warehouseId, supplierId],
+      `INSERT INTO products (brand_id,article_id,article,name,price,stock,warehouse_id,supplier_id,status) VALUES ($1,$2,$3,$4,ROUND($5::numeric*$9::numeric,2),$6,$7,$8,'active') ON CONFLICT (brand_id,normalized_article) DO UPDATE SET name=CASE WHEN products.name='' THEN EXCLUDED.name ELSE products.name END,updated_at=now() RETURNING id::text,(xmax=0) AS is_new`,
+      [
+        brandId,
+        articleId,
+        articleRaw,
+        name,
+        price ?? "0.00",
+        stock ?? 0,
+        warehouseId,
+        supplierId,
+        exchangeRate,
+      ],
     );
     const productId = product.rows[0]?.id;
     if (!productId) throw new Error("Не удалось сохранить товар");
@@ -982,16 +1039,26 @@ async function processRow(
       [warehouseId, brandId, article, productId, runId],
     );
     await client.query(
-      `INSERT INTO warehouse_products (warehouse_id,product_id,stock,purchase_price,updated_at) VALUES ($1,$2,$3,$4,now()) ON CONFLICT (warehouse_id,product_id) DO UPDATE SET stock=EXCLUDED.stock,purchase_price=EXCLUDED.purchase_price,updated_at=now()`,
-      [warehouseId, productId, stock ?? 0, price ?? 0],
+      `INSERT INTO warehouse_products (warehouse_id,product_id,stock,purchase_price,updated_at) VALUES ($1,$2,$3,ROUND($4::numeric*$5::numeric,2),now()) ON CONFLICT (warehouse_id,product_id) DO UPDATE SET stock=EXCLUDED.stock,purchase_price=EXCLUDED.purchase_price,updated_at=now()`,
+      [warehouseId, productId, stock ?? 0, price ?? "0.00", exchangeRate],
     );
     await client.query(
-      `INSERT INTO product_offers (product_id,warehouse_id,supplier_id,price,stock,lead_time_days,supplier_article,status,updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,CASE WHEN $5 > 0 THEN 'active' ELSE 'out_of_stock' END,now())
+      `INSERT INTO product_offers (product_id,warehouse_id,supplier_id,price,stock,lead_time_days,supplier_article,supplier_price,supplier_currency,exchange_rate,status,updated_at)
+       VALUES ($1,$2,$3,ROUND($4::numeric*$9::numeric,2),$5,$6,$7,$4,$8,$9,CASE WHEN $5 > 0 THEN 'active' ELSE 'out_of_stock' END,now())
        ON CONFLICT (product_id,warehouse_id,offer_key) DO UPDATE SET
          price=EXCLUDED.price,stock=EXCLUDED.stock,lead_time_days=EXCLUDED.lead_time_days,
-         supplier_article=EXCLUDED.supplier_article,status=EXCLUDED.status,updated_at=now()`,
-      [productId, warehouseId, supplierId, price ?? 0, stock ?? 0, leadTime, supplierArticleRaw],
+         supplier_article=EXCLUDED.supplier_article,supplier_price=EXCLUDED.supplier_price,supplier_currency=EXCLUDED.supplier_currency,exchange_rate=EXCLUDED.exchange_rate,status=EXCLUDED.status,updated_at=now()`,
+      [
+        productId,
+        warehouseId,
+        supplierId,
+        price ?? "0.00",
+        stock ?? 0,
+        leadTime,
+        supplierArticleRaw,
+        priceCurrency,
+        exchangeRate,
+      ],
     );
     await client.query(
       `UPDATE products p SET
@@ -1054,8 +1121,14 @@ export async function executePriceImport(params: {
   };
   try {
     const warehouse = await warehouseSettings(client, params.warehouseId);
+    const priceCurrency = params.meta.priceCurrency ?? warehouse.settings.priceCurrency;
+    if (!priceCurrency) throw new Error("Укажите валюту прайс-листа для склада");
+    params.meta.priceCurrency = priceCurrency;
+    params.meta.exchangeRate =
+      params.meta.exchangeRate ?? (await resolveExchangeRate(params.context, priceCurrency));
+    params.meta.exchangeRateSource = "manual";
     await client.query(
-      `UPDATE import_runs SET status='running',started_at=now(),warehouse_id=$2,supplier_id=$3,column_mapping=$4::jsonb,started_by=COALESCE(started_by,$5),source_file_path=COALESCE(source_file_path,$6),source_metadata=COALESCE(source_metadata,$7::jsonb) WHERE id=$1`,
+      `UPDATE import_runs SET status='running',started_at=now(),warehouse_id=$2,supplier_id=$3,column_mapping=$4::jsonb,started_by=COALESCE(started_by,$5),source_file_path=COALESCE(source_file_path,$6),price_currency=$8,exchange_rate=$9::numeric,exchange_rate_source=$10,source_metadata=COALESCE(source_metadata,$7::jsonb) WHERE id=$1`,
       [
         params.runId,
         params.warehouseId,
@@ -1072,7 +1145,13 @@ export async function executePriceImport(params: {
           tempFileId: params.meta.tempFileId,
           deleteMissing: params.meta.deleteMissing === true,
           safetyWarnings: params.meta.safetyWarnings ?? [],
+          priceCurrency: params.meta.priceCurrency ?? "UAH",
+          exchangeRate: params.meta.exchangeRate ?? "1",
+          exchangeRateSource: "manual",
         }),
+        params.meta.priceCurrency ?? "UAH",
+        params.meta.exchangeRate ?? "1",
+        "manual",
       ],
     );
     if (params.meta.format === "xlsx") {
@@ -1101,6 +1180,8 @@ export async function executePriceImport(params: {
           rowNumber,
           seen,
           counters,
+          params.meta.priceCurrency ?? "UAH",
+          params.meta.exchangeRate ?? "1",
         );
         batchSize += 1;
         if (batchSize >= 500) await finishBatch();
@@ -1172,6 +1253,8 @@ export async function executePriceImport(params: {
           i + 1,
           seen,
           counters,
+          params.meta.priceCurrency ?? "UAH",
+          params.meta.exchangeRate ?? "1",
         );
         batchSize += 1;
         if (batchSize >= 500) await finishBatch();
@@ -1212,6 +1295,8 @@ export async function executePriceImport(params: {
           line,
           seen,
           counters,
+          params.meta.priceCurrency ?? "UAH",
+          params.meta.exchangeRate ?? "1",
         );
         batchSize += 1;
         if (batchSize >= 500) await finishBatch();
@@ -1351,6 +1436,9 @@ type ImportRunRow = {
   duration_ms: number | string | null;
   summary: string | null;
   column_mapping: PriceColumnMapping | null;
+  price_currency: PriceCurrency | null;
+  exchange_rate: string | null;
+  exchange_rate_source: "manual" | null;
   created_at: Date;
 };
 function runView(row: ImportRunRow): ImportRun {
@@ -1378,6 +1466,9 @@ function runView(row: ImportRunRow): ImportRun {
     durationMs: row.duration_ms == null ? null : Number(row.duration_ms),
     summary: row.summary,
     columnMapping: row.column_mapping ?? null,
+    priceCurrency: row.price_currency,
+    exchangeRate: row.exchange_rate == null ? null : String(row.exchange_rate),
+    exchangeRateSource: row.exchange_rate_source,
     createdAt: row.created_at.toISOString(),
   };
 }
@@ -1452,6 +1543,7 @@ export async function handleAdminImportApi(
         estimatedRows: 0,
         retainForRetry: true,
         deleteMissing: settings.deleteMissing === true,
+        ...(settings.priceCurrency ? { priceCurrency: settings.priceCurrency } : {}),
       };
       const preview = await previewFile(meta, context);
       meta.estimatedRows = preview.estimatedRows;
@@ -1531,6 +1623,7 @@ export async function handleAdminImportApi(
       tempFileId?: string;
       warehouseId?: string;
       confirmSafety?: boolean;
+      priceCurrency?: PriceCurrency;
     };
     if (!body.tempFileId || !body.warehouseId)
       return Response.json({ ok: false, error: "Некорректные параметры" }, { status: 400 });
@@ -1567,9 +1660,20 @@ export async function handleAdminImportApi(
       return Response.json({ ok: false, error: "Недействительный файл" }, { status: 400 });
     const client = await db(context);
     try {
+      const warehouse = await warehouseSettings(client, body.warehouseId);
+      const priceCurrency = body.priceCurrency ?? warehouse.settings.priceCurrency;
+      if (!priceCurrency)
+        return Response.json(
+          { ok: false, error: "Укажите валюту прайс-листа для склада" },
+          { status: 422 },
+        );
+      const exchangeRate = await resolveExchangeRate(context, priceCurrency);
+      meta.priceCurrency = priceCurrency;
+      meta.exchangeRate = exchangeRate;
+      meta.exchangeRateSource = "manual";
       const result = await client.query<{ id: string }>(
-        `INSERT INTO import_runs(filename,source,status,warehouse_id,supplier_id,column_mapping,started_by,source_file_path,source_metadata,safety_warnings,safety_confirmed_at)
-         SELECT $1,'manual_upload','queued',$2,w.supplier_id,$3::jsonb,$4,$5,$6::jsonb,$7::jsonb,now()
+        `INSERT INTO import_runs(filename,source,status,warehouse_id,supplier_id,column_mapping,started_by,source_file_path,price_currency,exchange_rate,exchange_rate_source,source_metadata,safety_warnings,safety_confirmed_at)
+         SELECT $1,'manual_upload','queued',$2,w.supplier_id,$3::jsonb,$4,$5,$8,$9::numeric,'manual',$6::jsonb,$7::jsonb,now()
          FROM warehouses w WHERE w.id=$2 RETURNING id::text`,
         [
           meta.filename,
@@ -1581,34 +1685,48 @@ export async function handleAdminImportApi(
             format: meta.format,
             encoding: meta.encoding,
             delimiter: meta.delimiter,
+            headers: meta.headers,
             firstRowHeaders: meta.firstRowHeaders,
             mapping: meta.mapping,
             tempFileId: meta.tempFileId,
             deleteMissing: meta.deleteMissing === true,
             safetyWarnings: meta.safetyWarnings ?? [],
             validationErrors: meta.validationErrors ?? [],
+            priceCurrency,
+            exchangeRate,
+            exchangeRateSource: "manual",
           }),
           JSON.stringify(meta.safetyWarnings ?? []),
+          priceCurrency,
+          exchangeRate,
         ],
       );
       const runId = result.rows[0]?.id;
       if (!runId) throw new Error("Не удалось создать импорт");
+      const { createProcessingSnapshot } = await import("@/lib/import-jobs");
+      await createProcessingSnapshot(client, runId, {
+        warehouseId: body.warehouseId,
+        supplierId: warehouse.supplierId,
+        filename: meta.filename,
+        sourceFilePath: meta.filePath,
+        format: meta.format,
+        headers: meta.headers,
+        mapping: meta.mapping,
+        delimiter: meta.delimiter,
+        encoding: meta.encoding,
+        firstRowHeaders: meta.firstRowHeaders,
+        deleteMissing: meta.deleteMissing === true,
+        priceCurrency,
+        exchangeRate,
+        exchangeRateSource: "manual",
+        startedBy: auth.username ?? "admin",
+        estimatedRows: meta.estimatedRows,
+      });
       await writeImportAudit(client, runId, auth.username ?? "admin", "safety_confirmed", {
         warnings: meta.safetyWarnings ?? [],
         warehouseId: body.warehouseId,
         filename: meta.filename,
       });
-      const url = connectionString(context);
-      if (!url) throw new Error("PostgreSQL не подключён");
-      const backgroundTask = executePriceImport({
-        runId,
-        meta,
-        warehouseId: body.warehouseId,
-        context,
-        startedBy: auth.username ?? "admin",
-      });
-      if (context.adminRuntime?.waitUntil) context.adminRuntime.waitUntil(backgroundTask);
-      else setImmediate(() => void backgroundTask);
       return Response.json({ ok: true, runId });
     } finally {
       await client.end();
@@ -1715,10 +1833,14 @@ export async function handleAdminImportApi(
         filename: string;
         warehouse_id: string;
         supplier_id: string | null;
+        rows_total: number | string;
         source_file_path: string | null;
         source_metadata: Record<string, unknown> | null;
+        processing_snapshot: Record<string, unknown> | null;
+        price_currency: PriceCurrency | null;
+        exchange_rate: string | null;
       }>(
-        `SELECT status,filename,warehouse_id::text,supplier_id::text,source_file_path,source_metadata FROM import_runs WHERE id=$1`,
+        `SELECT status,filename,warehouse_id::text,supplier_id::text,rows_total,source_file_path,source_metadata,processing_snapshot,price_currency,exchange_rate::text FROM import_runs WHERE id=$1`,
         [body.runId],
       );
       const row = source.rows[0];
@@ -1729,24 +1851,76 @@ export async function handleAdminImportApi(
           { ok: false, error: "Повторить можно только импорт с ошибками или неуспешный импорт" },
           { status: 409 },
         );
-      if (!row || !row.warehouse_id || !row.source_file_path || !row.source_metadata)
+      if (!row || !row.source_metadata || !row.processing_snapshot)
         return Response.json(
-          { ok: false, error: "Для этого импорта исходный файл недоступен" },
+          { ok: false, error: "Для повтора нужен сохранённый snapshot исходного импорта" },
+          { status: 409 },
+        );
+      const snapshot = row.processing_snapshot;
+      const warehouseId = String(snapshot["warehouseId"] ?? row.warehouse_id ?? "");
+      const supplierId =
+        snapshot["supplierId"] === undefined
+          ? row.supplier_id
+          : (snapshot["supplierId"] as string | null);
+      const sourceFilePath = String(snapshot["sourceFilePath"] ?? row.source_file_path ?? "");
+      const priceCurrency =
+        (snapshot["priceCurrency"] as PriceCurrency | undefined) ?? row.price_currency;
+      const exchangeRate = String(snapshot["exchangeRate"] ?? row.exchange_rate ?? "");
+      const format = snapshot["format"] as UploadMeta["format"] | undefined;
+      const mapping = snapshot["mapping"] as PriceColumnMapping | undefined;
+      const delimiter = snapshot["delimiter"];
+      const encoding = snapshot["encoding"];
+      const firstRowHeaders = snapshot["firstRowHeaders"];
+      const deleteMissing = snapshot["deleteMissing"];
+      const headers = Array.isArray(snapshot["headers"])
+        ? (snapshot["headers"] as string[])
+        : Array.isArray(row.source_metadata["headers"])
+          ? (row.source_metadata["headers"] as string[])
+          : [];
+      if (
+        !warehouseId ||
+        !sourceFilePath ||
+        !priceCurrency ||
+        !exchangeRate ||
+        !format ||
+        !mapping ||
+        typeof delimiter !== "string" ||
+        typeof encoding !== "string" ||
+        typeof firstRowHeaders !== "boolean" ||
+        typeof deleteMissing !== "boolean"
+      )
+        return Response.json(
+          {
+            ok: false,
+            error:
+              "Повтор невозможен: immutable snapshot не содержит обязательные параметры обработки",
+          },
+          { status: 409 },
+        );
+      if (firstRowHeaders && headers.length === 0)
+        return Response.json(
+          {
+            ok: false,
+            error: "Повтор невозможен: в исходном snapshot отсутствуют заголовки файла",
+          },
           { status: 409 },
         );
       const meta = {
         tempFileId: String(row.source_metadata["tempFileId"] ?? `retry_${Date.now()}`),
-        filePath: row.source_file_path,
+        filePath: sourceFilePath,
         filename: row.filename,
-        format: row.source_metadata["format"] as UploadMeta["format"],
-        headers: [],
-        mapping: (row.source_metadata["mapping"] ?? {}) as PriceColumnMapping,
-        delimiter: String(row.source_metadata["delimiter"] ?? ""),
-        encoding: String(row.source_metadata["encoding"] ?? "utf-8"),
-        firstRowHeaders: row.source_metadata["firstRowHeaders"] !== false,
-        estimatedRows: 0,
+        format,
+        headers,
+        mapping,
+        delimiter,
+        encoding,
+        firstRowHeaders,
+        estimatedRows: Number(row.rows_total ?? row.source_metadata["estimatedRows"] ?? 0),
         retainForRetry: true,
-        deleteMissing: row.source_metadata["deleteMissing"] === true,
+        deleteMissing,
+        priceCurrency,
+        exchangeRate,
+        exchangeRateSource: "manual",
         safetyWarnings: Array.isArray(row.source_metadata["safetyWarnings"])
           ? (row.source_metadata["safetyWarnings"] as string[])
           : [],
@@ -1782,34 +1956,46 @@ export async function handleAdminImportApi(
         );
       }
       const result = await client.query<{ id: string }>(
-        `INSERT INTO import_runs(filename,source,status,warehouse_id,supplier_id,column_mapping,started_by,source_file_path,source_metadata,retry_of_run_id)
-         VALUES($1,'retry','queued',$2,$3,$4::jsonb,$5,$6,$7::jsonb,$8) RETURNING id::text`,
+        `INSERT INTO import_runs(filename,source,status,warehouse_id,supplier_id,column_mapping,started_by,source_file_path,price_currency,exchange_rate,exchange_rate_source,source_metadata,retry_of_run_id)
+         VALUES($1,'retry','queued',$2,$3,$4::jsonb,$5,$6,$9,$10::numeric,'manual',$7::jsonb,$8) RETURNING id::text`,
         [
           row.filename,
-          row.warehouse_id,
-          row.supplier_id,
+          warehouseId,
+          supplierId,
           JSON.stringify(meta.mapping),
           auth.username ?? "admin",
           meta.filePath,
           JSON.stringify(row.source_metadata),
           body.runId,
+          meta.priceCurrency ?? "UAH",
+          meta.exchangeRate || "1",
         ],
       );
       const runId = result.rows[0]?.id;
       if (!runId) throw new Error("Не удалось создать повторный импорт");
+      const { createProcessingSnapshot } = await import("@/lib/import-jobs");
+      await createProcessingSnapshot(client, runId, {
+        warehouseId,
+        supplierId,
+        filename: meta.filename,
+        sourceFilePath: meta.filePath,
+        format: meta.format,
+        headers: meta.headers,
+        mapping: meta.mapping,
+        delimiter: meta.delimiter,
+        encoding: meta.encoding,
+        firstRowHeaders: meta.firstRowHeaders,
+        deleteMissing: meta.deleteMissing === true,
+        priceCurrency,
+        exchangeRate,
+        exchangeRateSource: "manual",
+        startedBy: auth.username ?? "admin",
+        estimatedRows: meta.estimatedRows,
+      });
       await writeImportAudit(client, runId, auth.username ?? "admin", "retry_requested", {
         retryOfRunId: body.runId,
-        warehouseId: row.warehouse_id,
+        warehouseId,
       });
-      const task = executePriceImport({
-        runId,
-        meta,
-        warehouseId: row.warehouse_id,
-        context,
-        startedBy: auth.username ?? "admin",
-      });
-      if (context.adminRuntime?.waitUntil) context.adminRuntime.waitUntil(task);
-      else setImmediate(() => void task);
       return Response.json({ ok: true, runId });
     } finally {
       await client.end();
