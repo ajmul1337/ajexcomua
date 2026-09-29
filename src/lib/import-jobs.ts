@@ -187,31 +187,55 @@ export async function prepareImportBatches(
     const path = chunkPath(runId, batchNumber);
     const hash = createHash("sha256").update(body).digest("hex");
     await putChunk(path, body);
-    await client.query(
-      `INSERT INTO import_run_batches(import_run_id,batch_number,row_start,row_end,row_count,chunk_path,chunk_hash,source_cursor_start,source_cursor_end)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb)
-       ON CONFLICT (import_run_id,batch_number) DO UPDATE SET chunk_path=EXCLUDED.chunk_path,chunk_hash=EXCLUDED.chunk_hash
-       WHERE import_run_batches.chunk_hash=EXCLUDED.chunk_hash`,
-      [
-        runId,
-        batchNumber,
-        rows[0]!.rowNumber,
-        rows.at(-1)!.rowNumber,
-        rows.length,
-        path,
-        hash,
-        JSON.stringify({ row: rows[0]!.rowNumber }),
-        JSON.stringify({ row: rows.at(-1)!.rowNumber }),
-      ],
-    );
-    const checkpoint = await client.query(
-      `UPDATE import_runs SET prepared_through_row=$2,next_batch_number=$3,preparation_heartbeat_at=clock_timestamp(),preparation_lease_until=clock_timestamp()+interval '5 minutes'
-        WHERE id=$1 AND status='preparing' AND preparation_worker_id=$4
-          AND preparation_lease_until > clock_timestamp()`,
-      [runId, rows.at(-1)!.rowNumber, batchNumber + 1, workerId],
-    );
-    if (checkpoint.rowCount !== 1 || !(await heartbeatPreparation(client, runId, workerId)))
-      throw new Error("Preparation lease ownership was lost before checkpoint");
+    await client.query("BEGIN");
+    try {
+      const ownership = await client.query(
+        `SELECT id FROM import_runs
+          WHERE id=$1 AND status='preparing' AND preparation_worker_id=$2
+            AND preparation_lease_until > clock_timestamp()
+          FOR UPDATE`,
+        [runId, workerId],
+      );
+      if (ownership.rowCount !== 1)
+        throw new Error("Preparation lease ownership was lost before batch registration");
+      const inserted = await client.query(
+        `INSERT INTO import_run_batches(import_run_id,batch_number,row_start,row_end,row_count,chunk_path,chunk_hash,source_cursor_start,source_cursor_end)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb)
+         ON CONFLICT (import_run_id,batch_number) DO UPDATE SET chunk_path=EXCLUDED.chunk_path,chunk_hash=EXCLUDED.chunk_hash
+         WHERE import_run_batches.chunk_hash=EXCLUDED.chunk_hash`,
+        [
+          runId,
+          batchNumber,
+          rows[0]!.rowNumber,
+          rows.at(-1)!.rowNumber,
+          rows.length,
+          path,
+          hash,
+          JSON.stringify({ row: rows[0]!.rowNumber }),
+          JSON.stringify({ row: rows.at(-1)!.rowNumber }),
+        ],
+      );
+      if (inserted.rowCount !== 1) {
+        const existing = await client.query<{ chunk_hash: string }>(
+          `SELECT chunk_hash FROM import_run_batches WHERE import_run_id=$1 AND batch_number=$2`,
+          [runId, batchNumber],
+        );
+        if (existing.rows[0]?.chunk_hash !== hash)
+          throw new Error("Preparation batch already exists with a different chunk");
+      }
+      const checkpoint = await client.query(
+        `UPDATE import_runs SET prepared_through_row=$2,next_batch_number=$3,preparation_heartbeat_at=clock_timestamp(),preparation_lease_until=clock_timestamp()+interval '5 minutes'
+          WHERE id=$1 AND status='preparing' AND preparation_worker_id=$4
+            AND preparation_lease_until > clock_timestamp()`,
+        [runId, rows.at(-1)!.rowNumber, batchNumber + 1, workerId],
+      );
+      if (checkpoint.rowCount !== 1)
+        throw new Error("Preparation lease ownership was lost before checkpoint");
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
     batchNumber += 1;
     rows = [];
   };
@@ -396,11 +420,16 @@ export async function retryBatch(
   error: unknown,
 ): Promise<void> {
   await client.query(
-    `UPDATE import_run_batches
+    `UPDATE import_run_batches b
         SET status=CASE WHEN attempts >= 5 THEN 'failed' ELSE 'queued' END,
             next_attempt_at=CASE WHEN attempts >= 5 THEN NULL ELSE clock_timestamp() + make_interval(secs => LEAST(300, power(2, attempts)::int * 5)) END,
             lease_until=NULL, worker_id=NULL, last_error=$3
-      WHERE id=$1 AND status='processing' AND worker_id=$2 AND lease_until > clock_timestamp()`,
+      WHERE b.id=$1 AND b.status='processing' AND b.worker_id=$2 AND b.lease_until > clock_timestamp()
+        AND EXISTS (
+          SELECT 1 FROM import_runs r
+           WHERE r.id=b.import_run_id AND r.status='running'
+             AND r.worker_id=$2 AND r.lease_until > clock_timestamp()
+        )`,
     [batchId, workerId, error instanceof Error ? error.message : String(error)],
   );
 }
@@ -413,28 +442,24 @@ export async function completeBatchAndCounters(
   batchNumber: number,
   counters: Counters,
 ): Promise<boolean> {
-  const result = await client.query(
-    `WITH completed AS (
-       UPDATE import_run_batches
-          SET status='completed', finished_at=now(), lease_until=NULL, worker_id=NULL,
-              rows_processed=$4, rows_created=$5, rows_updated=$6, rows_skipped=$7,
-              rows_duplicate=$8, error_count=$9
-        WHERE id=$1 AND status='processing' AND worker_id=$2 AND lease_until > clock_timestamp()
-        RETURNING import_run_id
-     )
-     UPDATE import_runs r
-        SET rows_processed=rows_processed+$4, rows_created=rows_created+$5,
-            rows_updated=rows_updated+$6, rows_skipped=rows_skipped+$7,
-            rows_duplicate=rows_duplicate+$8, error_count=error_count+$9,
-            current_batch_number=$3, heartbeat_at=now()
-       FROM completed c
-      WHERE r.id=c.import_run_id AND r.id=$10 AND r.status='running'
-        AND r.worker_id=$2 AND r.lease_until > clock_timestamp()
-      RETURNING r.id`,
+  const ownership = await client.query(
+    `SELECT id FROM import_runs
+      WHERE id=$1 AND status='running' AND worker_id=$2
+        AND lease_until > clock_timestamp()
+      FOR UPDATE`,
+    [runId, workerId],
+  );
+  if (ownership.rowCount !== 1) return false;
+  const batch = await client.query(
+    `UPDATE import_run_batches
+        SET status='completed', finished_at=clock_timestamp(), lease_until=NULL, worker_id=NULL,
+            rows_processed=$3, rows_created=$4, rows_updated=$5, rows_skipped=$6,
+            rows_duplicate=$7, error_count=$8
+      WHERE id=$1 AND import_run_id=$9 AND status='processing' AND worker_id=$2
+        AND lease_until > clock_timestamp()`,
     [
       batchId,
       workerId,
-      batchNumber,
       counters.rowsProcessed,
       counters.rowsCreated,
       counters.rowsUpdated,
@@ -444,46 +469,77 @@ export async function completeBatchAndCounters(
       runId,
     ],
   );
-  if (result.rowCount !== 1) return false;
+  if (batch.rowCount !== 1) return false;
+  const updatedRun = await client.query(
+    `UPDATE import_runs
+        SET rows_processed=rows_processed+$2, rows_created=rows_created+$3,
+            rows_updated=rows_updated+$4, rows_skipped=rows_skipped+$5,
+            rows_duplicate=rows_duplicate+$6, error_count=error_count+$7,
+            current_batch_number=$8, heartbeat_at=clock_timestamp()
+      WHERE id=$1 AND status='running' AND worker_id=$9
+        AND lease_until > clock_timestamp()`,
+    [
+      runId,
+      counters.rowsProcessed,
+      counters.rowsCreated,
+      counters.rowsUpdated,
+      counters.rowsSkipped,
+      counters.rowsDuplicate,
+      counters.errorCount,
+      batchNumber,
+      workerId,
+    ],
+  );
+  if (updatedRun.rowCount !== 1) return false;
   return true;
 }
 
 export async function finalizeImportRun(client: Client, runId: string): Promise<void> {
   await client.query("BEGIN");
   try {
+    const runResult = await client.query<{
+      status: ImportStatus;
+      warehouse_id: string;
+      started_by: string | null;
+      snapshot: ProcessingSnapshot | null;
+      delete_missing: boolean;
+    }>(
+      `SELECT r.status,r.warehouse_id::text,r.started_by,r.processing_snapshot snapshot,
+              coalesce((r.processing_snapshot->>'deleteMissing')::boolean,false) delete_missing
+         FROM import_runs r WHERE r.id=$1 FOR UPDATE`,
+      [runId],
+    );
+    const run = runResult.rows[0];
+    if (!run || run.status !== "running" || !run.snapshot) {
+      await client.query("ROLLBACK");
+      return;
+    }
     const result = await client.query<{
       failed: string;
       remaining: string;
       errors: string;
-      delete_missing: boolean;
-      warehouse_id: string;
-      started_by: string | null;
-      snapshot: ProcessingSnapshot | null;
     }>(
       `SELECT count(*) FILTER (WHERE b.status='failed')::text failed,
               count(*) FILTER (WHERE b.status IN ('queued','processing'))::text remaining,
-              coalesce(sum(b.error_count),0)::text errors,
-              r.warehouse_id::text, r.started_by, r.processing_snapshot snapshot,
-              coalesce((r.processing_snapshot->>'deleteMissing')::boolean,false) delete_missing
-         FROM import_runs r LEFT JOIN import_run_batches b ON b.import_run_id=r.id
-        WHERE r.id=$1 GROUP BY r.id`,
+              coalesce(sum(b.error_count),0)::text errors
+         FROM import_run_batches b WHERE b.import_run_id=$1`,
       [runId],
     );
     const row = result.rows[0];
-    if (!row || Number(row.remaining) > 0 || !row.snapshot) {
+    if (!row || Number(row.remaining) > 0) {
       await client.query("ROLLBACK");
       return;
     }
     const status: ImportStatus =
       Number(row.failed) > 0 || Number(row.errors) > 0 ? "completed_with_errors" : "completed";
-    if (status === "completed" && row.delete_missing) {
+    if (status === "completed" && run.delete_missing) {
       await client.query(
         `UPDATE warehouse_products wp SET stock=0,updated_at=now()
           WHERE wp.warehouse_id=$1 AND NOT EXISTS (
             SELECT 1 FROM warehouse_product_import_keys k
              WHERE k.warehouse_id=wp.warehouse_id AND k.product_id=wp.product_id AND k.last_import_run_id=$2
           )`,
-        [row.warehouse_id, runId],
+        [run.warehouse_id, runId],
       );
       await client.query(
         `UPDATE product_offers o SET stock=0,status='out_of_stock',updated_at=now()
@@ -491,7 +547,7 @@ export async function finalizeImportRun(client: Client, runId: string): Promise<
             SELECT 1 FROM warehouse_product_import_keys k
              WHERE k.warehouse_id=o.warehouse_id AND k.product_id=o.product_id AND k.last_import_run_id=$2
           )`,
-        [row.warehouse_id, runId],
+        [run.warehouse_id, runId],
       );
     }
     await client.query(

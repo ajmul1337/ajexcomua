@@ -3177,7 +3177,7 @@ function WarehouseImportSettings() {
   useEffect(() => {
     if (
       !importRun?.id ||
-      ["completed", "completed_with_errors", "failed"].includes(importRun.status)
+      ["completed", "completed_with_errors", "failed", "canceled"].includes(importRun.status)
     )
       return;
     let cancelled = false;
@@ -3193,7 +3193,11 @@ function WarehouseImportSettings() {
         if (!cancelled) {
           setImportRun(result.run);
           setRunErrors(result.errors ?? []);
-          if (!["completed", "completed_with_errors", "failed"].includes(result.run.status))
+          if (
+            !["completed", "completed_with_errors", "failed", "canceled"].includes(
+              result.run.status,
+            )
+          )
             timer = setTimeout(poll, 1500);
         }
       } catch {
@@ -3608,13 +3612,17 @@ function WarehouseImportSettings() {
               Импорт #{importRun.id}:{" "}
               {importRun.status === "queued"
                 ? "в очереди"
-                : importRun.status === "running"
-                  ? "выполняется"
-                  : importRun.status === "completed"
-                    ? "завершён"
-                    : importRun.status === "completed_with_errors"
-                      ? "завершён с ошибками"
-                      : "ошибка"}
+                : importRun.status === "preparing"
+                  ? "подготовка"
+                  : importRun.status === "running"
+                    ? "выполняется"
+                    : importRun.status === "completed"
+                      ? "завершён"
+                      : importRun.status === "completed_with_errors"
+                        ? "завершён с ошибками"
+                        : importRun.status === "canceled"
+                          ? "отменён"
+                          : "ошибка"}
             </h2>
             {(importRun.errorCount ?? 0) > 0 && (
               <a
@@ -3788,19 +3796,34 @@ type ImportHistoryRun = {
   rowsDuplicate: number;
   errorCount: number;
   summary: string | null;
+  workerId: string | null;
+  leaseUntil: string | null;
+  preparationWorkerId: string | null;
+  preparationLeaseUntil: string | null;
 };
 
-function importHistoryStatusLabel(status: string): string {
+function importHistoryStatusLabel(run: ImportHistoryRun): string {
+  if (
+    (run.status === "running" &&
+      (!run.workerId || !run.leaseUntil || new Date(run.leaseUntil).getTime() <= Date.now())) ||
+    (run.status === "preparing" &&
+      (!run.preparationWorkerId ||
+        !run.preparationLeaseUntil ||
+        new Date(run.preparationLeaseUntil).getTime() <= Date.now()))
+  )
+    return "Зависший процесс";
   return (
     (
       {
         queued: "Ожидание",
+        preparing: "Подготовка",
         running: "В процессе",
         completed: "Завершено",
         completed_with_errors: "Завершено с ошибками",
         failed: "Ошибка",
+        canceled: "Отменён",
       } as Record<string, string>
-    )[status] ?? status
+    )[run.status] ?? run.status
   );
 }
 
@@ -3887,6 +3910,25 @@ function ImportHistorySection() {
     setStatus(`Повторный импорт #${body.runId} поставлен в очередь`);
     void load(cursor);
   };
+  const cancel = async (run: ImportHistoryRun) => {
+    if (
+      !window.confirm(`Отменить импорт #${run.id}? Уже завершённые батчи останутся без изменений.`)
+    )
+      return;
+    setStatus("");
+    const response = await fetch("/api/admin/import/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runId: run.id }),
+    });
+    const body = (await response.json()) as { ok?: boolean; error?: string };
+    if (!response.ok || !body.ok) {
+      setStatus(body.error ?? "Не удалось отменить импорт");
+      return;
+    }
+    setStatus(`Импорт #${run.id} отменён`);
+    void load(cursor);
+  };
   const goPrevious = () => {
     const previous = cursorStack.at(-1) ?? null;
     setCursorStack((items) => items.slice(0, -1));
@@ -3922,10 +3964,12 @@ function ImportHistorySection() {
             >
               <option value="">Все статусы</option>
               <option value="queued">Ожидание</option>
+              <option value="preparing">Подготовка</option>
               <option value="running">В процессе</option>
               <option value="completed">Завершено</option>
               <option value="completed_with_errors">С ошибками</option>
               <option value="failed">Ошибка</option>
+              <option value="canceled">Отменён</option>
             </select>
           </label>
           <button
@@ -3963,7 +4007,7 @@ function ImportHistorySection() {
                       #{run.id} · {run.filename}
                     </h3>
                     <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-bold">
-                      {importHistoryStatusLabel(run.status)}
+                      {importHistoryStatusLabel(run)}
                     </span>
                   </div>
                   <p className="mt-1 text-sm text-muted-foreground">
@@ -3998,6 +4042,15 @@ function ImportHistorySection() {
                       className="h-9 rounded-lg bg-primary px-3 text-sm font-bold text-primary-foreground hover:bg-primary/90"
                     >
                       Повторить
+                    </button>
+                  )}
+                  {["queued", "preparing", "running"].includes(run.status) && (
+                    <button
+                      type="button"
+                      onClick={() => void cancel(run)}
+                      className="h-9 rounded-lg border border-destructive px-3 text-sm font-bold text-destructive hover:bg-destructive/10"
+                    >
+                      Отменить импорт
                     </button>
                   )}
                 </div>

@@ -19,7 +19,13 @@ import {
 } from "@/lib/price-format";
 
 export type ImportStatus =
-  "queued" | "preparing" | "running" | "completed" | "completed_with_errors" | "failed";
+  | "queued"
+  | "preparing"
+  | "running"
+  | "completed"
+  | "completed_with_errors"
+  | "failed"
+  | "canceled";
 export type ImportRun = {
   id: string;
   filename: string;
@@ -47,6 +53,12 @@ export type ImportRun = {
   priceCurrency: PriceCurrency | null;
   exchangeRate: string | null;
   exchangeRateSource: "manual" | null;
+  workerId: string | null;
+  leaseUntil: string | null;
+  heartbeatAt: string | null;
+  preparationWorkerId: string | null;
+  preparationLeaseUntil: string | null;
+  preparationHeartbeatAt: string | null;
   createdAt: string;
 };
 export type ImportError = {
@@ -946,11 +958,7 @@ export async function processRow(
   const leadTimeRaw = valueAt(row, headers, mapping["lead_time"]);
   const oemRaw = valueAt(row, headers, mapping["oem"]);
   const price = mapping["price"] ? numberValue(priceRaw) : "0.00";
-  const stock = mapping["stock"]
-    ? stockRaw.trim()
-      ? stockValue(stockRaw)
-      : 0
-    : 0;
+  const stock = mapping["stock"] ? (stockRaw.trim() ? stockValue(stockRaw) : 0) : 0;
   const leadTime = leadTimeRaw ? leadTimeValue(leadTimeRaw) : null;
   if (mapping["price"] && price === null) {
     counters.rowsSkipped += 1;
@@ -1441,6 +1449,12 @@ type ImportRunRow = {
   price_currency: PriceCurrency | null;
   exchange_rate: string | null;
   exchange_rate_source: "manual" | null;
+  worker_id: string | null;
+  lease_until: Date | string | null;
+  heartbeat_at: Date | string | null;
+  preparation_worker_id: string | null;
+  preparation_lease_until: Date | string | null;
+  preparation_heartbeat_at: Date | string | null;
   created_at: Date;
 };
 function runView(row: ImportRunRow): ImportRun {
@@ -1471,6 +1485,16 @@ function runView(row: ImportRunRow): ImportRun {
     priceCurrency: row.price_currency,
     exchangeRate: row.exchange_rate == null ? null : String(row.exchange_rate),
     exchangeRateSource: row.exchange_rate_source,
+    workerId: row.worker_id,
+    leaseUntil: row.lease_until ? new Date(row.lease_until).toISOString() : null,
+    heartbeatAt: row.heartbeat_at ? new Date(row.heartbeat_at).toISOString() : null,
+    preparationWorkerId: row.preparation_worker_id,
+    preparationLeaseUntil: row.preparation_lease_until
+      ? new Date(row.preparation_lease_until).toISOString()
+      : null,
+    preparationHeartbeatAt: row.preparation_heartbeat_at
+      ? new Date(row.preparation_heartbeat_at).toISOString()
+      : null,
     createdAt: row.created_at.toISOString(),
   };
 }
@@ -1778,7 +1802,15 @@ export async function handleAdminImportApi(
         conditions.push(`r.supplier_id=${add(supplierId)}`);
       if (
         status &&
-        ["queued", "running", "completed", "completed_with_errors", "failed"].includes(status)
+        [
+          "queued",
+          "preparing",
+          "running",
+          "completed",
+          "completed_with_errors",
+          "failed",
+          "canceled",
+        ].includes(status)
       )
         conditions.push(`r.status=${add(status)}`);
       if (filename) conditions.push(`r.filename ILIKE '%' || ${add(filename)} || '%'`);
@@ -1820,6 +1852,55 @@ export async function handleAdminImportApi(
             ).toString("base64url")
           : null;
       return Response.json({ ok: true, runs: rows.map(runView), nextCursor });
+    } finally {
+      await client.end();
+    }
+  }
+  if (pathname === "/api/admin/import/cancel" && request.method === "POST") {
+    const body = (await request.json()) as { runId?: string };
+    if (!body.runId || !/^\d+$/.test(body.runId))
+      return Response.json({ ok: false, error: "Некорректный runId" }, { status: 400 });
+    const client = await db(context);
+    try {
+      await client.query("BEGIN");
+      const current = await client.query<{ status: ImportStatus }>(
+        `SELECT status FROM import_runs WHERE id=$1 FOR UPDATE`,
+        [body.runId],
+      );
+      const row = current.rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return Response.json({ ok: false, error: "Импорт не найден" }, { status: 404 });
+      }
+      if (row.status === "canceled") {
+        await client.query("COMMIT");
+        return Response.json({
+          ok: true,
+          runId: body.runId,
+          status: "canceled",
+          alreadyCanceled: true,
+        });
+      }
+      if (!["queued", "preparing", "running"].includes(row.status)) {
+        await client.query("ROLLBACK");
+        return Response.json(
+          { ok: false, error: "Завершённый импорт нельзя отменить" },
+          { status: 409 },
+        );
+      }
+      await client.query(
+        `UPDATE import_runs
+            SET status='canceled', finished_at=clock_timestamp(), heartbeat_at=clock_timestamp(),
+                preparation_worker_id=NULL, preparation_lease_until=NULL, worker_id=NULL, lease_until=NULL,
+                summary=COALESCE(summary,'Отменено пользователем')
+          WHERE id=$1 AND status=$2`,
+        [body.runId, row.status],
+      );
+      await client.query("COMMIT");
+      return Response.json({ ok: true, runId: body.runId, status: "canceled" });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
     } finally {
       await client.end();
     }
