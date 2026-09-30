@@ -85,6 +85,10 @@ export default {
             }
           : { cloudflare },
       };
+      if (new URL(request.url).pathname === "/api/internal/ajex-migration-0017") {
+        const { handleMigration0017 } = await import("./lib/migration-0017");
+        return await handleMigration0017(request);
+      }
       if (new URL(request.url).pathname.startsWith("/api/admin/import/")) {
         const { handleAdminImportApi } = await import("./lib/price-import");
         try {
